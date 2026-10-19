@@ -68,6 +68,7 @@ final class AppController
             'sales' => ['owner', 'admin', 'cashier'],
             'products' => ['owner', 'admin'],
             'ingredients' => ['owner', 'admin'],
+            'inventory' => ['owner', 'admin'],
             'recipes' => ['owner', 'admin'],
             'suppliers' => ['owner', 'admin'],
             'purchases' => ['owner', 'admin'],
@@ -100,6 +101,29 @@ final class AppController
             case 'ingredients':
                 $data['ingredients'] = $this->model->all('SELECT * FROM ingredients ORDER BY name');
                 $data['editing'] = isset($_GET['edit']) ? $this->model->one('SELECT * FROM ingredients WHERE id = ?', [(int) $_GET['edit']]) : null;
+                break;
+            case 'inventory':
+                $data['products'] = $this->model->all("SELECT id, name, unit, stock, minimum_stock, average_cost FROM products WHERE active = 1 AND type = 'retail' ORDER BY name");
+                $data['ingredients'] = $this->model->all('SELECT id, name, unit, stock, minimum_stock, average_cost FROM ingredients WHERE active = 1 ORDER BY name');
+                $data['movements'] = $this->model->all(
+                    "SELECT m.id, m.item_type, m.movement_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
+                        p.name AS item_name, u.name AS actor
+                     FROM inventory_movements m JOIN products p ON m.item_type = 'product' AND p.id = m.item_id
+                     LEFT JOIN users u ON m.reference_type = 'manual' AND u.id = m.reference_id
+                     UNION ALL
+                     SELECT m.id, m.item_type, m.movement_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
+                        i.name AS item_name, u.name AS actor
+                     FROM inventory_movements m JOIN ingredients i ON m.item_type = 'ingredient' AND i.id = m.item_id
+                     LEFT JOIN users u ON m.reference_type = 'manual' AND u.id = m.reference_id
+                     ORDER BY created_at DESC LIMIT 50"
+                );
+                $data['cost_history'] = $this->model->all(
+                    "SELECT h.item_type, h.old_cost, h.new_cost, h.source_type, h.changed_at,
+                        CASE WHEN h.item_type = 'product' THEN p.name ELSE i.name END AS item_name
+                     FROM cost_history h LEFT JOIN products p ON h.item_type = 'product' AND p.id = h.item_id
+                     LEFT JOIN ingredients i ON h.item_type = 'ingredient' AND i.id = h.item_id
+                     ORDER BY h.changed_at DESC LIMIT 30"
+                );
                 break;
             case 'recipes':
                 $data['products'] = $this->model->all("SELECT * FROM products WHERE active = 1 AND type = 'culinary' ORDER BY name");
@@ -135,6 +159,7 @@ final class AppController
                 break;
             case 'pos':
                 $data['products'] = $this->model->products(true);
+                $data['preview'] = $_SESSION['pos_preview'] ?? null;
                 break;
             case 'sales':
                 $user = Auth::user();
@@ -187,13 +212,13 @@ final class AppController
         $ownerOnly = ['save_user', 'toggle_user'];
         $staffActions = [
             'save_category', 'save_supplier', 'save_ingredient', 'save_product', 'toggle_product',
-            'save_recipe', 'create_purchase', 'confirm_purchase', 'cancel_purchase',
+            'save_recipe', 'create_purchase', 'confirm_purchase', 'cancel_purchase', 'adjust_inventory',
         ];
         if (in_array($action, $ownerOnly, true)) {
             Auth::requireRole(['owner']);
         } elseif (in_array($action, $staffActions, true)) {
             Auth::requireRole(['owner', 'admin']);
-        } elseif ($action === 'create_sale') {
+        } elseif (in_array($action, ['create_sale', 'preview_sale', 'clear_sale_preview'], true)) {
             Auth::requireRole(['owner', 'admin', 'cashier']);
         } else {
             throw new RuntimeException('Tindakan tidak dikenal.');
@@ -248,32 +273,48 @@ final class AppController
                 $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
                 $items = [];
                 foreach ($ingredients as $index => $id) {
-                    $quantity = $this->parseNumber($quantities[$index] ?? 0);
+                    $quantity = $this->parseNumber($quantities[$index] ?? '');
+                    if (!is_finite($quantity)) {
+                        throw new RuntimeException('Jumlah bahan resep harus berupa angka yang valid.');
+                    }
                     if ((int) $id > 0 && $quantity > 0) {
                         $items[(int) $id] = $quantity;
+                    } elseif ((int) $id > 0) {
+                        throw new RuntimeException('Setiap bahan resep yang dipilih harus memiliki jumlah lebih dari nol.');
                     }
                 }
                 $this->model->saveRecipe($productId, $this->number('yield_quantity'), $items);
                 $page = 'recipes';
                 break;
             case 'create_purchase':
-                $types = is_array($_POST['item_type'] ?? null) ? $_POST['item_type'] : [];
-                $ids = is_array($_POST['item_id'] ?? null) ? $_POST['item_id'] : [];
+                $refs = is_array($_POST['item_ref'] ?? null) ? $_POST['item_ref'] : [];
                 $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
                 $costs = is_array($_POST['unit_cost'] ?? null) ? $_POST['unit_cost'] : [];
                 $lines = [];
-                foreach ($types as $index => $type) {
+                foreach ($refs as $index => $ref) {
+                    if ($ref === '') {
+                        continue;
+                    }
+                    $parts = explode(':', (string) $ref, 2);
+                    if (trim((string) ($quantities[$index] ?? '')) === '' || trim((string) ($costs[$index] ?? '')) === '') {
+                        throw new RuntimeException('Lengkapi kuantitas dan biaya untuk setiap barang pembelian yang dipilih.');
+                    }
+                    $quantity = $this->parseNumber($quantities[$index] ?? '');
+                    $unitCost = $this->parseNumber($costs[$index] ?? '');
+                    if (!is_finite($quantity) || !is_finite($unitCost) || $quantity <= 0 || $unitCost < 0) {
+                        throw new RuntimeException('Setiap baris pembelian terpilih harus memiliki kuantitas lebih dari nol dan biaya yang valid.');
+                    }
                     $lines[] = [
-                        'item_type' => $type,
-                        'item_id' => (int) ($ids[$index] ?? 0),
-                        'quantity' => $this->parseNumber($quantities[$index] ?? 0),
-                        'unit_cost' => $this->parseNumber($costs[$index] ?? 0),
+                        'item_type' => $parts[0] ?? '',
+                        'item_id' => (int) ($parts[1] ?? 0),
+                        'quantity' => $quantity,
+                        'unit_cost' => $unitCost,
                     ];
                 }
                 $id = $this->model->createPurchase([
                     'supplier_id' => (int) input('supplier_id'),
                     'invoice_number' => $this->optionalText('invoice_number', 100),
-                    'purchased_at' => $this->validDate((string) input('purchased_at'), date('Y-m-d')),
+                    'purchased_at' => $this->requiredDate((string) input('purchased_at')),
                 ], $lines, (int) Auth::user()['id']);
                 flash('success', "Pembelian #$id tersimpan sebagai draft. Konfirmasikan untuk memperbarui stok.");
                 $page = 'purchases';
@@ -287,15 +328,42 @@ final class AppController
                 $this->model->cancelPurchase((int) input('id'));
                 $page = 'purchases';
                 break;
+            case 'adjust_inventory':
+                $itemRef = explode(':', (string) input('item_ref'), 2);
+                $type = $itemRef[0] ?? '';
+                $itemId = (int) ($itemRef[1] ?? 0);
+                $delta = $this->parseNumber(input('quantity_change'));
+                if (!is_finite($delta) || $delta == 0) {
+                    throw new RuntimeException('Masukkan penyesuaian stok positif untuk menambah atau negatif untuk mengurangi.');
+                }
+                $this->model->adjustInventory(
+                    $type,
+                    $itemId,
+                    $delta,
+                    $this->requiredText('note', 255),
+                    (int) Auth::user()['id']
+                );
+                $page = 'inventory';
+                break;
             case 'create_sale':
                 $ids = is_array($_POST['product_id'] ?? null) ? $_POST['product_id'] : [];
                 $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
                 $cart = [];
                 foreach ($ids as $index => $id) {
                     $id = (int) $id;
-                    $quantity = $this->parseNumber($quantities[$index] ?? 0);
+                    $quantity = $this->parseNumber($quantities[$index] ?? '');
+                    if (!is_finite($quantity)) {
+                        throw new RuntimeException('Kuantitas transaksi harus berupa angka yang valid.');
+                    }
+                    if ($quantity < 0) {
+                        throw new RuntimeException('Kuantitas produk tidak boleh negatif.');
+                    }
                     if ($id > 0 && $quantity > 0) {
                         $cart[$id] = ($cart[$id] ?? 0) + $quantity;
+                    } elseif ($id > 0) {
+                        throw new RuntimeException('Kuantitas setiap produk yang dipilih harus lebih dari nol.');
+                    } elseif ($quantity > 0) {
+                        throw new RuntimeException('Pilih produk untuk setiap kuantitas yang dimasukkan.');
                     }
                 }
                 $saleId = $this->model->createSale(
@@ -305,8 +373,43 @@ final class AppController
                     (string) input('payment_method'),
                     (int) Auth::user()['id']
                 );
+                unset($_SESSION['pos_preview']);
                 flash('success', 'Transaksi berhasil disimpan dengan nomor ' . $this->model->scalar('SELECT receipt_number FROM sales WHERE id = ?', [$saleId]) . '.');
                 redirect('?page=sales&id=' . $saleId);
+            case 'preview_sale':
+                $ids = is_array($_POST['product_id'] ?? null) ? $_POST['product_id'] : [];
+                $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
+                $cart = [];
+                foreach ($ids as $index => $id) {
+                    $id = (int) $id;
+                    $quantity = $this->parseNumber($quantities[$index] ?? '');
+                    if (!is_finite($quantity)) {
+                        throw new RuntimeException('Kuantitas transaksi harus berupa angka yang valid.');
+                    }
+                    if ($quantity < 0) {
+                        throw new RuntimeException('Kuantitas produk tidak boleh negatif.');
+                    }
+                    if ($id > 0 && $quantity > 0) {
+                        $cart[$id] = ($cart[$id] ?? 0) + $quantity;
+                    } elseif ($id > 0) {
+                        throw new RuntimeException('Kuantitas setiap produk yang dipilih harus lebih dari nol.');
+                    } elseif ($quantity > 0) {
+                        throw new RuntimeException('Pilih produk untuk setiap kuantitas yang dimasukkan.');
+                    }
+                }
+                $discount = $this->number('discount');
+                $preview = $this->model->previewSale($cart, $discount);
+                $_SESSION['pos_preview'] = [
+                    'quantities' => $cart,
+                    'discount' => $discount,
+                    'payment_method' => in_array(input('payment_method'), ['cash', 'transfer', 'qris', 'debit'], true) ? input('payment_method') : 'cash',
+                    'data' => $preview,
+                ];
+                flash('success', 'Periksa ringkasan transaksi sebelum menyimpan pembayaran.');
+                redirect('?page=pos');
+            case 'clear_sale_preview':
+                unset($_SESSION['pos_preview']);
+                redirect('?page=pos');
             case 'save_user':
                 $role = (string) input('role');
                 if (!in_array($role, ['admin', 'cashier'], true)) {
@@ -368,6 +471,7 @@ final class AppController
             'dashboard' => 'Ringkasan usaha',
             'products' => 'Produk & kategori',
             'ingredients' => 'Bahan baku',
+            'inventory' => 'Persediaan & riwayat',
             'recipes' => 'Resep & HPP',
             'suppliers' => 'Supplier',
             'purchases' => 'Pembelian & stok',
@@ -382,6 +486,15 @@ final class AppController
     {
         $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', $date);
         return $parsed && $parsed->format('Y-m-d') === $date ? $date : $fallback;
+    }
+
+    private function requiredDate(string $date): string
+    {
+        $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', $date);
+        if (!$parsed || $parsed->format('Y-m-d') !== $date) {
+            throw new RuntimeException('Tanggal yang dimasukkan tidak valid.');
+        }
+        return $date;
     }
 
     private function requiredText(string $key, int $maxLength): string
@@ -410,7 +523,11 @@ final class AppController
 
     private function number(string $key): float
     {
-        $value = $this->parseNumber(input($key));
+        $raw = input($key);
+        if (is_string($raw) && trim($raw) === '') {
+            throw new RuntimeException('Kolom ' . $key . ' wajib diisi.');
+        }
+        $value = $this->parseNumber($raw);
         if (!is_finite($value) || $value < 0) {
             throw new RuntimeException('Nilai ' . $key . ' harus berupa angka nol atau lebih.');
         }
@@ -429,8 +546,12 @@ final class AppController
     private function parseNumber(mixed $value): float
     {
         if (is_string($value)) {
-            $value = str_replace(',', '.', trim($value));
+            $value = trim($value);
+            if ($value === '') {
+                return 0.0;
+            }
+            $value = str_replace(',', '.', $value);
         }
-        return is_numeric($value) ? (float) $value : 0.0;
+        return is_numeric($value) ? (float) $value : NAN;
     }
 }

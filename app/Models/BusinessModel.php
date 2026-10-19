@@ -64,7 +64,7 @@ final class BusinessModel
             return ['product' => $product, 'unit_cost' => (float) $product['average_cost'], 'ingredients' => []];
         }
 
-        $recipe = $this->one('SELECT * FROM recipes WHERE product_id = ?', [$productId]);
+        $recipe = $this->one('SELECT * FROM recipes WHERE product_id = ?' . ($lock ? ' FOR UPDATE' : ''), [$productId]);
         if (!$recipe || (float) $recipe['yield_quantity'] <= 0) {
             throw new RuntimeException('Resep produk belum diatur dengan hasil produksi yang valid.');
         }
@@ -123,15 +123,17 @@ final class BusinessModel
 
     public function saveProduct(?int $id, array $data): void
     {
-        $values = [
-            $data['category_id'] ?: null, $data['name'], $data['type'], $data['unit'],
-            $data['selling_price'], $data['minimum_stock'], $data['min_margin'], $data['target_margin'],
-        ];
         if ($id) {
+            if (!$this->one('SELECT id FROM products WHERE id = ?', [$id])) {
+                throw new RuntimeException('Produk yang akan diubah tidak ditemukan.');
+            }
             $this->db->prepare(
-                'UPDATE products SET category_id = ?, name = ?, type = ?, unit = ?, selling_price = ?,
+                'UPDATE products SET category_id = ?, name = ?, unit = ?, selling_price = ?,
                     minimum_stock = ?, min_margin = ?, target_margin = ? WHERE id = ?'
-            )->execute([...$values, $id]);
+            )->execute([
+                $data['category_id'] ?: null, $data['name'], $data['unit'], $data['selling_price'],
+                $data['minimum_stock'], $data['min_margin'], $data['target_margin'], $id,
+            ]);
             return;
         }
         $this->db->prepare(
@@ -148,7 +150,14 @@ final class BusinessModel
     public function saveUser(?int $id, array $data): void
     {
         if ($id) {
+            $existing = $this->one('SELECT role FROM users WHERE id = ?', [$id]);
+            if (!$existing || $existing['role'] === 'owner') {
+                throw new RuntimeException('Akun pemilik tidak dapat diubah melalui pengelolaan akun operasional.');
+            }
             if ($data['password'] !== '') {
+                if (strlen($data['password']) < 10) {
+                    throw new RuntimeException('Kata sandi baru minimal 10 karakter.');
+                }
                 $this->db->prepare('UPDATE users SET name = ?, email = ?, role = ?, password = ? WHERE id = ?')
                     ->execute([$data['name'], $data['email'], $data['role'], password_hash($data['password'], PASSWORD_DEFAULT), $id]);
             } else {
@@ -183,6 +192,8 @@ final class BusinessModel
             if (!$product || $product['type'] !== 'culinary') {
                 throw new RuntimeException('Resep hanya dapat diatur untuk produk kuliner.');
             }
+            $oldRecipeExists = (bool) $this->scalar('SELECT COUNT(*) FROM recipes WHERE product_id = ?', [$productId]);
+            $oldCost = $oldRecipeExists ? $this->productCost($productId)['unit_cost'] : 0.0;
             $this->db->prepare(
                 'INSERT INTO recipes (product_id, yield_quantity) VALUES (?, ?)
                  ON DUPLICATE KEY UPDATE yield_quantity = VALUES(yield_quantity)'
@@ -197,6 +208,13 @@ final class BusinessModel
             }
             if ((int) $this->scalar('SELECT COUNT(*) FROM recipe_items WHERE recipe_id = ?', [$recipeId]) === 0) {
                 throw new RuntimeException('Resep harus memiliki bahan baku dengan jumlah lebih dari nol.');
+            }
+            $newCost = $this->productCost($productId)['unit_cost'];
+            if (abs($oldCost - $newCost) >= 0.01) {
+                $this->db->prepare(
+                    'INSERT INTO cost_history (item_type, item_id, old_cost, new_cost, source_type, source_id)
+                     VALUES ("product", ?, ?, ?, "recipe", ?)'
+                )->execute([$productId, $oldCost, $newCost, $productId]);
             }
             $this->db->commit();
         } catch (Throwable $exception) {
@@ -231,7 +249,10 @@ final class BusinessModel
                  VALUES (?, ?, ?, ?, ?, ?)'
             );
             foreach ($lines as $line) {
-                $itemType = $line['item_type'] === 'product' ? 'product' : 'ingredient';
+                if (!in_array($line['item_type'], ['product', 'ingredient'], true)) {
+                    throw new RuntimeException('Jenis barang pembelian tidak valid.');
+                }
+                $itemType = $line['item_type'];
                 $item = $itemType === 'product'
                     ? $this->one('SELECT id, type FROM products WHERE id = ? AND active = 1', [(int) $line['item_id']])
                     : $this->one('SELECT id FROM ingredients WHERE id = ? AND active = 1', [(int) $line['item_id']]);
@@ -312,9 +333,90 @@ final class BusinessModel
         }
     }
 
+    public function adjustInventory(string $type, int $id, float $delta, string $note, int $userId): void
+    {
+        if (!in_array($type, ['ingredient', 'product'], true) || $id <= 0 || !is_finite($delta) || $delta == 0) {
+            throw new RuntimeException('Jenis barang, ID, atau jumlah penyesuaian tidak valid.');
+        }
+        $table = $type === 'product' ? 'products' : 'ingredients';
+        $this->db->beginTransaction();
+        try {
+            $record = $this->one("SELECT stock, average_cost" . ($type === 'product' ? ', type' : '') . " FROM $table WHERE id = ? AND active = 1 FOR UPDATE", [$id]);
+            if (!$record || ($type === 'product' && $record['type'] !== 'retail')) {
+                throw new RuntimeException('Barang tidak ditemukan atau bukan persediaan yang dapat disesuaikan.');
+            }
+            $newStock = (float) $record['stock'] + $delta;
+            if ($newStock < 0) {
+                throw new RuntimeException('Penyesuaian tidak dapat membuat stok menjadi negatif.');
+            }
+            $this->db->prepare("UPDATE $table SET stock = ? WHERE id = ?")->execute([$newStock, $id]);
+            $this->db->prepare(
+                'INSERT INTO inventory_movements
+                 (item_type, item_id, movement_type, reference_type, reference_id, quantity_change, unit_cost, note)
+                 VALUES (?, ?, "adjustment", "manual", ?, ?, ?, ?)'
+            )->execute([$type, $id, $userId, $delta, $record['average_cost'], $note]);
+            $this->db->commit();
+        } catch (Throwable $exception) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $exception;
+        }
+    }
+
+    public function previewSale(array $quantities, float $discount): array
+    {
+        if (!is_finite($discount) || $discount < 0) {
+            throw new RuntimeException('Diskon transaksi tidak valid.');
+        }
+        $lines = [];
+        $subtotal = 0.0;
+        $costTotal = 0.0;
+        foreach ($quantities as $productId => $quantity) {
+            if (!is_finite((float) $quantity) || $quantity <= 0) {
+                throw new RuntimeException('Kuantitas produk harus berupa angka lebih dari nol.');
+            }
+            $cost = $this->productCost((int) $productId);
+            $lineTotal = round((float) $cost['product']['selling_price'] * $quantity, 2);
+            $lineCost = round($cost['unit_cost'] * $quantity, 2);
+            $subtotal += $lineTotal;
+            $costTotal += $lineCost;
+            $lines[] = [
+                'product' => $cost['product'],
+                'quantity' => $quantity,
+                'unit_cost' => $cost['unit_cost'],
+                'line_total' => $lineTotal,
+                'line_cost' => $lineCost,
+            ];
+        }
+        if (!$lines) {
+            throw new RuntimeException('Pilih minimal satu produk dengan kuantitas lebih dari nol.');
+        }
+        $subtotal = round($subtotal, 2);
+        $costTotal = round($costTotal, 2);
+        if ($discount > $subtotal) {
+            throw new RuntimeException('Diskon tidak boleh melebihi subtotal transaksi.');
+        }
+        $discount = round($discount, 2);
+        return [
+            'lines' => $lines,
+            'subtotal' => $subtotal,
+            'discount' => $discount,
+            'total' => $subtotal - $discount,
+            'cost_total' => $costTotal,
+        ];
+    }
+
     public function createSale(array $quantities, float $discount, float $paid, string $method, int $userId): int
     {
-        $quantities = array_filter($quantities, static fn (float $quantity): bool => $quantity > 0);
+        if (!is_finite($discount) || $discount < 0 || !is_finite($paid) || $paid < 0) {
+            throw new RuntimeException('Nilai diskon atau pembayaran tidak valid.');
+        }
+        foreach ($quantities as $quantity) {
+            if (!is_finite((float) $quantity) || $quantity <= 0) {
+                throw new RuntimeException('Kuantitas produk harus berupa angka lebih dari nol.');
+            }
+        }
         if (!$quantities) {
             throw new RuntimeException('Pilih minimal satu produk untuk transaksi.');
         }
@@ -342,8 +444,8 @@ final class BusinessModel
                         }
                     }
                 }
-                $lineTotal = (float) $product['selling_price'] * $quantity;
-                $lineCost = $cost['unit_cost'] * $quantity;
+                $lineTotal = round((float) $product['selling_price'] * $quantity, 2);
+                $lineCost = round($cost['unit_cost'] * $quantity, 2);
                 $subtotal += $lineTotal;
                 $costTotal += $lineCost;
                 $items[] = [
@@ -356,13 +458,27 @@ final class BusinessModel
                     'yield' => $cost['yield'] ?? 1,
                 ];
             }
-            if ($discount < 0 || $discount > $subtotal) {
+            $subtotal = round($subtotal, 2);
+            $costTotal = round($costTotal, 2);
+            $discount = round($discount, 2);
+            if ($discount > $subtotal) {
                 throw new RuntimeException('Diskon tidak boleh melebihi subtotal transaksi.');
             }
-            $total = $subtotal - $discount;
+            $total = round($subtotal - $discount, 2);
             if ($paid < $total) {
                 throw new RuntimeException('Jumlah pembayaran kurang dari total transaksi.');
             }
+            $discountRemaining = $discount;
+            foreach ($items as $index => &$item) {
+                $lineDiscount = $index === array_key_last($items)
+                    ? $discountRemaining
+                    : round($discount * $item['line_total'] / ($subtotal ?: 1), 2);
+                $lineDiscount = min($lineDiscount, $item['line_total']);
+                $item['line_total'] = round($item['line_total'] - $lineDiscount, 2);
+                $discountRemaining = round($discountRemaining - $lineDiscount, 2);
+            }
+            unset($item);
+            $costTotal = round($costTotal, 2);
             $receipt = 'TRX-' . date('YmdHis') . '-' . strtoupper(bin2hex(random_bytes(2)));
             $this->db->prepare(
                 'INSERT INTO sales

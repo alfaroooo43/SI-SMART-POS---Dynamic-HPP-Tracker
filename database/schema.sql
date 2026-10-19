@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
     reference_id BIGINT UNSIGNED NOT NULL,
     quantity_change DECIMAL(14,3) NOT NULL,
     unit_cost DECIMAL(14,2) NOT NULL DEFAULT 0,
+    note VARCHAR(255) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_inventory_reference (reference_type, reference_id),
     INDEX idx_inventory_item (item_type, item_id, created_at)
