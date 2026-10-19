@@ -447,17 +447,30 @@ final class AppController
 
     private function createInitialOwner(): void
     {
-        if ((int) $this->model->scalar('SELECT COUNT(*) FROM users') > 0) {
+        $lock = (int) $this->model->scalar("SELECT GET_LOCK('si_smart_pos_initial_owner', 10)");
+        if ($lock !== 1) {
+            throw new RuntimeException('Setup sedang digunakan. Silakan coba kembali sebentar lagi.');
+        }
+        $alreadyExists = false;
+        try {
+            if ((int) $this->model->scalar('SELECT COUNT(*) FROM users') > 0) {
+                $alreadyExists = true;
+            } else {
+                $name = $this->requiredText('name', 120);
+                $email = filter_var(input('email'), FILTER_VALIDATE_EMAIL);
+                $password = (string) input('password');
+                if (!$email || strlen($password) < 10) {
+                    throw new RuntimeException('Masukkan email yang valid dan kata sandi minimal 10 karakter.');
+                }
+                $statement = Database::connection()->prepare('INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, "owner")');
+                $statement->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT)]);
+            }
+        } finally {
+            $this->model->scalar("SELECT RELEASE_LOCK('si_smart_pos_initial_owner')");
+        }
+        if ($alreadyExists) {
             redirect('?page=login');
         }
-        $name = $this->requiredText('name', 120);
-        $email = filter_var(input('email'), FILTER_VALIDATE_EMAIL);
-        $password = (string) input('password');
-        if (!$email || strlen($password) < 10) {
-            throw new RuntimeException('Masukkan email yang valid dan kata sandi minimal 10 karakter.');
-        }
-        $statement = Database::connection()->prepare('INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, "owner")');
-        $statement->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT)]);
         flash('success', 'Akun pemilik berhasil dibuat. Silakan masuk.');
         redirect('?page=login');
     }
