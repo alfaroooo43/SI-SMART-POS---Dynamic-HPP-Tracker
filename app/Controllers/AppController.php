@@ -24,6 +24,7 @@ final class AppController
     public function dispatch(): void
     {
         try {
+            Auth::refresh();
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 Csrf::verify();
                 $this->handlePost((string) ($_POST['action'] ?? ''));
@@ -40,7 +41,9 @@ final class AppController
                 error_log('SMART POS error: ' . $exception);
                 flash('error', 'Terjadi kesalahan saat memproses permintaan. Silakan coba kembali.');
             }
-            $page = Auth::check() ? (string) ($_POST['return_page'] ?? 'dashboard') : 'login';
+            $page = ($_POST['action'] ?? '') === 'setup'
+                ? 'setup'
+                : (Auth::check() ? (string) ($_POST['return_page'] ?? 'dashboard') : 'login');
             redirect('?page=' . rawurlencode($page));
         }
     }
@@ -371,7 +374,8 @@ final class AppController
                     $this->number('discount'),
                     $this->number('amount_paid'),
                     (string) input('payment_method'),
-                    (int) Auth::user()['id']
+                    (int) Auth::user()['id'],
+                    (string) input('checkout_token')
                 );
                 unset($_SESSION['pos_preview']);
                 flash('success', 'Transaksi berhasil disimpan dengan nomor ' . $this->model->scalar('SELECT receipt_number FROM sales WHERE id = ?', [$saleId]) . '.');
@@ -402,6 +406,7 @@ final class AppController
                 $_SESSION['pos_preview'] = [
                     'quantities' => $cart,
                     'discount' => $discount,
+                    'checkout_token' => bin2hex(random_bytes(32)),
                     'payment_method' => in_array(input('payment_method'), ['cash', 'transfer', 'qris', 'debit'], true) ? input('payment_method') : 'cash',
                     'data' => $preview,
                 ];

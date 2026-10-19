@@ -139,7 +139,10 @@ final class BusinessModel
         $this->db->prepare(
             'INSERT INTO products (category_id, name, type, unit, selling_price, minimum_stock, min_margin, target_margin)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-        )->execute($values);
+        )->execute([
+            $data['category_id'] ?: null, $data['name'], $data['type'], $data['unit'],
+            $data['selling_price'], $data['minimum_stock'], $data['min_margin'], $data['target_margin'],
+        ]);
     }
 
     public function setProductActive(int $id, bool $active): void
@@ -213,7 +216,7 @@ final class BusinessModel
             if (abs($oldCost - $newCost) >= 0.01) {
                 $this->db->prepare(
                     'INSERT INTO cost_history (item_type, item_id, old_cost, new_cost, source_type, source_id)
-                     VALUES ("product", ?, ?, ?, "recipe", ?)'
+                     VALUES (\'product\', ?, ?, ?, \'recipe\', ?)'
                 )->execute([$productId, $oldCost, $newCost, $productId]);
             }
             $this->db->commit();
@@ -353,7 +356,7 @@ final class BusinessModel
             $this->db->prepare(
                 'INSERT INTO inventory_movements
                  (item_type, item_id, movement_type, reference_type, reference_id, quantity_change, unit_cost, note)
-                 VALUES (?, ?, "adjustment", "manual", ?, ?, ?, ?)'
+                 VALUES (?, ?, \'adjustment\', \'manual\', ?, ?, ?, ?)'
             )->execute([$type, $id, $userId, $delta, $record['average_cost'], $note]);
             $this->db->commit();
         } catch (Throwable $exception) {
@@ -407,10 +410,17 @@ final class BusinessModel
         ];
     }
 
-    public function createSale(array $quantities, float $discount, float $paid, string $method, int $userId): int
+    public function createSale(array $quantities, float $discount, float $paid, string $method, int $userId, string $checkoutToken): int
     {
         if (!is_finite($discount) || $discount < 0 || !is_finite($paid) || $paid < 0) {
             throw new RuntimeException('Nilai diskon atau pembayaran tidak valid.');
+        }
+        if (!preg_match('/^[a-f0-9]{64}$/', $checkoutToken)) {
+            throw new RuntimeException('Token transaksi tidak valid. Silakan tinjau ulang keranjang.');
+        }
+        $existingSale = $this->scalar('SELECT id FROM sales WHERE checkout_token = ?', [$checkoutToken]);
+        if ($existingSale !== false) {
+            return (int) $existingSale;
         }
         foreach ($quantities as $quantity) {
             if (!is_finite((float) $quantity) || $quantity <= 0) {
@@ -429,6 +439,7 @@ final class BusinessModel
             $items = [];
             $subtotal = 0.0;
             $costTotal = 0.0;
+            $reservedIngredients = [];
             foreach ($quantities as $productId => $quantity) {
                 $cost = $this->productCost((int) $productId, true);
                 $product = $cost['product'];
@@ -439,9 +450,14 @@ final class BusinessModel
                 if ($product['type'] === 'culinary') {
                     foreach ($cost['ingredients'] as $ingredient) {
                         $required = (float) $ingredient['quantity'] / $cost['yield'] * $quantity;
-                        if ((float) $ingredient['stock'] < $required) {
+                        $reserved = ($reservedIngredients[$ingredient['ingredient_id']]['quantity'] ?? 0.0) + $required;
+                        if ((float) $ingredient['stock'] < $reserved) {
                             throw new RuntimeException('Stok bahan "' . $ingredient['name'] . '" tidak cukup untuk produk "' . $product['name'] . '".');
                         }
+                        $reservedIngredients[$ingredient['ingredient_id']] = [
+                            'quantity' => $reserved,
+                            'stock' => (float) $ingredient['stock'],
+                        ];
                     }
                 }
                 $lineTotal = round((float) $product['selling_price'] * $quantity, 2);
@@ -482,9 +498,9 @@ final class BusinessModel
             $receipt = 'TRX-' . date('YmdHis') . '-' . strtoupper(bin2hex(random_bytes(2)));
             $this->db->prepare(
                 'INSERT INTO sales
-                 (receipt_number, user_id, sold_at, subtotal, discount, total, cost_total, payment_method, amount_paid, change_amount)
-                 VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?)'
-            )->execute([$receipt, $userId, $subtotal, $discount, $total, $costTotal, $method, $paid, $paid - $total]);
+                 (receipt_number, checkout_token, user_id, sold_at, subtotal, discount, total, cost_total, payment_method, amount_paid, change_amount)
+                 VALUES (?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?)'
+            )->execute([$receipt, $checkoutToken, $userId, $subtotal, $discount, $total, $costTotal, $method, $paid, round($paid - $total, 2)]);
             $saleId = (int) $this->db->lastInsertId();
             $insertLine = $this->db->prepare(
                 'INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, line_total, line_cost)
@@ -514,6 +530,12 @@ final class BusinessModel
         } catch (Throwable $exception) {
             if ($this->db->inTransaction()) {
                 $this->db->rollBack();
+            }
+            if ($exception instanceof \PDOException && $exception->getCode() === '23000') {
+                $existingSale = $this->scalar('SELECT id FROM sales WHERE checkout_token = ?', [$checkoutToken]);
+                if ($existingSale !== false) {
+                    return (int) $existingSale;
+                }
             }
             throw $exception;
         }

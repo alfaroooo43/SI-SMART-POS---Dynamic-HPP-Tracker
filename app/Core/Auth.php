@@ -10,6 +10,26 @@ final class Auth
         return $_SESSION['user'] ?? null;
     }
 
+    public static function refresh(): void
+    {
+        $current = self::user();
+        if (!$current) {
+            return;
+        }
+        $statement = Database::connection()->prepare(
+            'SELECT id, name, email, role, active FROM users WHERE id = ? LIMIT 1'
+        );
+        $statement->execute([$current['id']]);
+        $user = $statement->fetch();
+        if (!$user || !(bool) $user['active']) {
+            self::logout();
+            flash('error', 'Akun Anda tidak lagi aktif. Hubungi pemilik usaha.');
+            return;
+        }
+        unset($user['active']);
+        $_SESSION['user'] = $user;
+    }
+
     public static function check(): bool
     {
         return self::user() !== null;
@@ -28,6 +48,7 @@ final class Auth
         }
 
         session_regenerate_id(true);
+        unset($_SESSION['pos_preview']);
         unset($user['password'], $user['active']);
         $_SESSION['user'] = $user;
         return true;
@@ -36,6 +57,7 @@ final class Auth
     public static function logout(): void
     {
         unset($_SESSION['user']);
+        unset($_SESSION['pos_preview']);
         session_regenerate_id(true);
     }
 
