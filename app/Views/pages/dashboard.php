@@ -7,6 +7,8 @@
 <section class="stats-grid">
     <article class="stat-card"><span class="stat-icon green">↗</span><span class="stat-label">Omzet</span><strong><?= rupiah($summary['revenue']) ?></strong><small>Penjualan setelah diskon</small></article>
     <article class="stat-card"><span class="stat-icon yellow">◈</span><span class="stat-label">Laba kotor</span><strong><?= rupiah($summary['gross_profit']) ?></strong><small>Omzet dikurangi HPP</small></article>
+    <article class="stat-card"><span class="stat-icon red">−</span><span class="stat-label">Biaya operasional</span><strong><?= rupiah($summary['expenses']) ?></strong><small>Biaya tercatat pada periode</small></article>
+    <article class="stat-card"><span class="stat-icon green">✓</span><span class="stat-label">Laba bersih</span><strong><?= rupiah($summary['net_profit']) ?></strong><small>Laba kotor dikurangi biaya</small></article>
     <article class="stat-card"><span class="stat-icon blue">▤</span><span class="stat-label">Transaksi</span><strong><?= number_format((int) $summary['transactions'], 0, ',', '.') ?></strong><small>Transaksi terkonfirmasi</small></article>
     <article class="stat-card"><span class="stat-icon red">◉</span><span class="stat-label">Stok perlu dicek</span><strong><?= number_format($low_stock, 0, ',', '.') ?></strong><small>Produk atau bahan di bawah batas</small></article>
 </section>

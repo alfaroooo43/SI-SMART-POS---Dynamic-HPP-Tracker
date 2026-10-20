@@ -38,6 +38,7 @@ $authPages = ['login', 'setup'];
                     ['recipes', '♧', 'Resep & HPP', ['owner', 'admin']],
                     ['suppliers', '⇄', 'Supplier', ['owner', 'admin']],
                     ['purchases', '▣', 'Pembelian & stok', ['owner', 'admin']],
+                    ['expenses', '−', 'Biaya operasional', ['owner', 'admin']],
                     ['reports', '▥', 'Laporan', ['owner', 'admin']],
                     ['users', '♙', 'Pengguna', ['owner']],
                 ];

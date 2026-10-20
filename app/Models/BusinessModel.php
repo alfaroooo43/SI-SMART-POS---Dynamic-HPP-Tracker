@@ -191,7 +191,7 @@ final class BusinessModel
         }
         $this->db->beginTransaction();
         try {
-            $product = $this->one('SELECT id, type FROM products WHERE id = ? FOR UPDATE', [$productId]);
+            $product = $this->one('SELECT id, type, name FROM products WHERE id = ? FOR UPDATE', [$productId]);
             if (!$product || $product['type'] !== 'culinary') {
                 throw new RuntimeException('Resep hanya dapat diatur untuk produk kuliner.');
             }
@@ -214,10 +214,7 @@ final class BusinessModel
             }
             $newCost = $this->productCost($productId)['unit_cost'];
             if (abs($oldCost - $newCost) >= 0.01) {
-                $this->db->prepare(
-                    'INSERT INTO cost_history (item_type, item_id, old_cost, new_cost, source_type, source_id)
-                     VALUES (\'product\', ?, ?, ?, \'recipe\', ?)'
-                )->execute([$productId, $oldCost, $newCost, $productId]);
+                $this->recordCostHistory('product', $productId, $oldCost, $newCost, 'recipe', $productId, (string) $product['name']);
             }
             $this->db->commit();
         } catch (Throwable $exception) {
@@ -248,8 +245,9 @@ final class BusinessModel
             )->execute([$data['supplier_id'], $userId, $data['invoice_number'] ?: null, $data['purchased_at'], $total]);
             $purchaseId = (int) $this->db->lastInsertId();
             $insert = $this->db->prepare(
-                'INSERT INTO purchase_items (purchase_id, item_type, item_id, quantity, unit_cost, line_total)
-                 VALUES (?, ?, ?, ?, ?, ?)'
+                'INSERT INTO purchase_items
+                 (purchase_id, item_type, item_id, ingredient_id, product_id, item_name_snapshot, unit_snapshot, quantity, unit_cost, line_total)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
             );
             foreach ($lines as $line) {
                 if (!in_array($line['item_type'], ['product', 'ingredient'], true)) {
@@ -257,13 +255,16 @@ final class BusinessModel
                 }
                 $itemType = $line['item_type'];
                 $item = $itemType === 'product'
-                    ? $this->one('SELECT id, type FROM products WHERE id = ? AND active = 1', [(int) $line['item_id']])
-                    : $this->one('SELECT id FROM ingredients WHERE id = ? AND active = 1', [(int) $line['item_id']]);
+                    ? $this->one('SELECT id, name, unit, type FROM products WHERE id = ? AND active = 1', [(int) $line['item_id']])
+                    : $this->one('SELECT id, name, unit FROM ingredients WHERE id = ? AND active = 1', [(int) $line['item_id']]);
                 if (!$item || ($itemType === 'product' && $item['type'] !== 'retail')) {
                     throw new RuntimeException('Barang pembelian tidak valid. Pembelian produk hanya berlaku untuk produk retail.');
                 }
                 $insert->execute([
-                    $purchaseId, $itemType, (int) $line['item_id'], $line['quantity'],
+                    $purchaseId, $itemType, (int) $line['item_id'],
+                    $itemType === 'ingredient' ? (int) $line['item_id'] : null,
+                    $itemType === 'product' ? (int) $line['item_id'] : null,
+                    $item['name'], $item['unit'], $line['quantity'],
                     $line['unit_cost'], (float) $line['quantity'] * (float) $line['unit_cost'],
                 ]);
             }
@@ -305,16 +306,26 @@ final class BusinessModel
                 $this->db->prepare("UPDATE $table SET stock = ?, average_cost = ? WHERE id = ?")
                     ->execute([$newStock, $newCost, $item['item_id']]);
                 if (abs($oldCost - $newCost) >= 0.01) {
-                    $this->db->prepare(
-                        'INSERT INTO cost_history (item_type, item_id, old_cost, new_cost, source_type, source_id)
-                         VALUES (?, ?, ?, ?, ?, ?)'
-                    )->execute([$item['item_type'], $item['item_id'], $oldCost, $newCost, 'purchase', $purchaseId]);
+                    $this->recordCostHistory(
+                        $item['item_type'],
+                        (int) $item['item_id'],
+                        $oldCost,
+                        $newCost,
+                        'purchase',
+                        $purchaseId,
+                        $item['item_name_snapshot']
+                    );
                 }
-                $this->db->prepare(
-                    'INSERT INTO inventory_movements
-                     (item_type, item_id, movement_type, reference_type, reference_id, quantity_change, unit_cost)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)'
-                )->execute([$item['item_type'], $item['item_id'], 'purchase', 'purchase', $purchaseId, $quantity, $item['unit_cost']]);
+                $this->recordMovement(
+                    $item['item_type'],
+                    (int) $item['item_id'],
+                    'purchase',
+                    $purchaseId,
+                    $quantity,
+                    (float) $item['unit_cost'],
+                    $item['item_name_snapshot'],
+                    $item['unit_snapshot']
+                );
             }
             $this->db->prepare("UPDATE purchases SET status = 'confirmed', confirmed_at = NOW() WHERE id = ?")
                 ->execute([$purchaseId]);
@@ -344,7 +355,7 @@ final class BusinessModel
         $table = $type === 'product' ? 'products' : 'ingredients';
         $this->db->beginTransaction();
         try {
-            $record = $this->one("SELECT stock, average_cost" . ($type === 'product' ? ', type' : '') . " FROM $table WHERE id = ? AND active = 1 FOR UPDATE", [$id]);
+            $record = $this->one("SELECT stock, average_cost, name, unit" . ($type === 'product' ? ', type' : '') . " FROM $table WHERE id = ? AND active = 1 FOR UPDATE", [$id]);
             if (!$record || ($type === 'product' && $record['type'] !== 'retail')) {
                 throw new RuntimeException('Barang tidak ditemukan atau bukan persediaan yang dapat disesuaikan.');
             }
@@ -353,11 +364,7 @@ final class BusinessModel
                 throw new RuntimeException('Penyesuaian tidak dapat membuat stok menjadi negatif.');
             }
             $this->db->prepare("UPDATE $table SET stock = ? WHERE id = ?")->execute([$newStock, $id]);
-            $this->db->prepare(
-                'INSERT INTO inventory_movements
-                 (item_type, item_id, movement_type, reference_type, reference_id, quantity_change, unit_cost, note)
-                 VALUES (?, ?, \'adjustment\', \'manual\', ?, ?, ?, ?)'
-            )->execute([$type, $id, $userId, $delta, $record['average_cost'], $note]);
+            $this->recordMovement($type, $id, 'adjustment', $userId, $delta, (float) $record['average_cost'], $record['name'], $record['unit'], $note, $userId);
             $this->db->commit();
         } catch (Throwable $exception) {
             if ($this->db->inTransaction()) {
@@ -503,26 +510,45 @@ final class BusinessModel
             )->execute([$receipt, $checkoutToken, $userId, $subtotal, $discount, $total, $costTotal, $method, $paid, round($paid - $total, 2)]);
             $saleId = (int) $this->db->lastInsertId();
             $insertLine = $this->db->prepare(
-                'INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, unit_cost, line_total, line_cost)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                'INSERT INTO sale_items
+                 (sale_id, product_id, product_name, unit_snapshot, quantity, unit_price, unit_cost, line_total, line_cost)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
             );
             foreach ($items as $item) {
                 $product = $item['product'];
                 $insertLine->execute([
-                    $saleId, $product['id'], $product['name'], $item['quantity'], $product['selling_price'],
+                    $saleId, $product['id'], $product['name'], $product['unit'], $item['quantity'], $product['selling_price'],
                     $item['unit_cost'], $item['line_total'], $item['line_cost'],
                 ]);
                 if ($product['type'] === 'retail') {
                     $this->db->prepare('UPDATE products SET stock = stock - ? WHERE id = ?')
                         ->execute([$item['quantity'], $product['id']]);
-                    $this->recordMovement('product', (int) $product['id'], 'sale', $saleId, -(float) $item['quantity'], $item['unit_cost']);
+                    $this->recordMovement(
+                        'product',
+                        (int) $product['id'],
+                        'sale',
+                        $saleId,
+                        -(float) $item['quantity'],
+                        $item['unit_cost'],
+                        $product['name'],
+                        $product['unit']
+                    );
                     continue;
                 }
                 foreach ($item['ingredients'] as $ingredient) {
                     $used = (float) $ingredient['quantity'] / $item['yield'] * $item['quantity'];
                     $this->db->prepare('UPDATE ingredients SET stock = stock - ? WHERE id = ?')
                         ->execute([$used, $ingredient['ingredient_id']]);
-                    $this->recordMovement('ingredient', (int) $ingredient['ingredient_id'], 'sale', $saleId, -$used, (float) $ingredient['average_cost']);
+                    $this->recordMovement(
+                        'ingredient',
+                        (int) $ingredient['ingredient_id'],
+                        'sale',
+                        $saleId,
+                        -$used,
+                        (float) $ingredient['average_cost'],
+                        $ingredient['name'],
+                        $ingredient['unit']
+                    );
                 }
             }
             $this->db->commit();
@@ -541,22 +567,124 @@ final class BusinessModel
         }
     }
 
-    private function recordMovement(string $type, int $id, string $movement, int $reference, float $quantity, float $cost): void
+    private function recordMovement(
+        string $type,
+        int $id,
+        string $movement,
+        int $reference,
+        float $quantity,
+        float $cost,
+        string $itemName,
+        string $unit,
+        ?string $note = null,
+        ?int $userId = null
+    ): void
     {
         $this->db->prepare(
             'INSERT INTO inventory_movements
-             (item_type, item_id, movement_type, reference_type, reference_id, quantity_change, unit_cost)
-             VALUES (?, ?, ?, ?, ?, ?, ?)'
-        )->execute([$type, $id, $movement, 'sale', $reference, $quantity, $cost]);
+             (item_type, item_id, ingredient_id, product_id, user_id, item_name_snapshot, unit_snapshot,
+              movement_type, reference_type, reference_id, quantity_change, unit_cost, note)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )->execute([
+            $type,
+            $id,
+            $type === 'ingredient' ? $id : null,
+            $type === 'product' ? $id : null,
+            $userId,
+            $itemName,
+            $unit,
+            $movement,
+            $movement === 'adjustment' ? 'manual' : $movement,
+            $reference,
+            $quantity,
+            $cost,
+            $note,
+        ]);
+    }
+
+    private function recordCostHistory(
+        string $type,
+        int $id,
+        float $oldCost,
+        float $newCost,
+        string $source,
+        int $sourceId,
+        string $itemName
+    ): void {
+        $this->db->prepare(
+            'INSERT INTO cost_history
+             (item_type, item_id, ingredient_id, product_id, item_name_snapshot, old_cost, new_cost, source_type, source_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )->execute([
+            $type,
+            $id,
+            $type === 'ingredient' ? $id : null,
+            $type === 'product' ? $id : null,
+            $itemName,
+            $oldCost,
+            $newCost,
+            $source,
+            $sourceId,
+        ]);
+    }
+
+    public function createExpense(array $data, int $userId): int
+    {
+        if (!is_finite((float) $data['amount']) || (float) $data['amount'] <= 0) {
+            throw new RuntimeException('Biaya operasional harus lebih dari nol.');
+        }
+        if (!in_array($data['payment_method'], ['cash', 'transfer', 'qris', 'debit', 'other'], true)) {
+            throw new RuntimeException('Metode pembayaran biaya operasional tidak valid.');
+        }
+        $this->db->prepare(
+            'INSERT INTO operational_expenses (user_id, expense_date, category, description, amount, payment_method)
+             VALUES (?, ?, ?, ?, ?, ?)'
+        )->execute([
+            $userId,
+            $data['expense_date'],
+            $data['category'],
+            $data['description'],
+            $data['amount'],
+            $data['payment_method'],
+        ]);
+        return (int) $this->db->lastInsertId();
+    }
+
+    public function voidExpense(int $id, string $note, int $userId): void
+    {
+        $statement = $this->db->prepare(
+            "UPDATE operational_expenses SET status = 'voided', voided_at = NOW(), voided_by = ?, void_note = ?
+             WHERE id = ? AND status = 'recorded'"
+        );
+        $statement->execute([$userId, $note, $id]);
+        if ($statement->rowCount() !== 1) {
+            throw new RuntimeException('Biaya tidak ditemukan atau sudah dibatalkan sebelumnya.');
+        }
+    }
+
+    public function expenses(string $from, string $to): array
+    {
+        return $this->all(
+            'SELECT e.*, u.name AS created_by, v.name AS voided_by_name
+             FROM operational_expenses e JOIN users u ON u.id = e.user_id
+             LEFT JOIN users v ON v.id = e.voided_by
+             WHERE e.expense_date BETWEEN ? AND ? ORDER BY e.expense_date DESC, e.id DESC',
+            [$from, $to]
+        );
     }
 
     public function dashboard(string $from, string $to): array
     {
         $summary = $this->one(
             'SELECT COALESCE(SUM(total), 0) AS revenue, COALESCE(SUM(total - cost_total), 0) AS gross_profit,
+                (SELECT COALESCE(SUM(amount), 0) FROM operational_expenses
+                    WHERE status = \'recorded\' AND expense_date BETWEEN ? AND ?) AS expenses,
+                COALESCE(SUM(total - cost_total), 0) -
+                    (SELECT COALESCE(SUM(amount), 0) FROM operational_expenses
+                    WHERE status = \'recorded\' AND expense_date BETWEEN ? AND ?) AS net_profit,
                 COUNT(*) AS transactions
              FROM sales WHERE DATE(sold_at) BETWEEN ? AND ?',
-            [$from, $to]
+            [$from, $to, $from, $to, $from, $to]
         );
         $lowRetail = (int) $this->scalar('SELECT COUNT(*) FROM products WHERE active = 1 AND type = "retail" AND stock <= minimum_stock');
         $lowIngredients = (int) $this->scalar('SELECT COUNT(*) FROM ingredients WHERE active = 1 AND stock <= minimum_stock');
@@ -590,19 +718,53 @@ final class BusinessModel
 
     public function report(string $from, string $to): array
     {
+        $summary = $this->one(
+            'SELECT COALESCE(SUM(s.total), 0) AS revenue, COALESCE(SUM(s.cost_total), 0) AS cogs,
+                COALESCE(SUM(s.total - s.cost_total), 0) AS gross_profit, COUNT(s.id) AS transactions,
+                (SELECT COALESCE(SUM(e.amount), 0) FROM operational_expenses e
+                 WHERE e.status = \'recorded\' AND e.expense_date BETWEEN ? AND ?) AS expenses
+             FROM sales s WHERE DATE(s.sold_at) BETWEEN ? AND ?',
+            [$from, $to, $from, $to]
+        );
+        $summary['net_profit'] = (float) $summary['gross_profit'] - (float) $summary['expenses'];
+        $daily = [];
+        foreach ($this->all(
+            'SELECT DATE(sold_at) AS day, COUNT(*) AS transactions, SUM(total) AS revenue,
+                SUM(cost_total) AS cogs, SUM(total - cost_total) AS gross_profit
+             FROM sales WHERE DATE(sold_at) BETWEEN ? AND ? GROUP BY DATE(sold_at)',
+            [$from, $to]
+        ) as $row) {
+            $daily[$row['day']] = $row + ['expenses' => 0.0];
+        }
+        foreach ($this->all(
+            'SELECT expense_date AS day, SUM(amount) AS expenses
+             FROM operational_expenses WHERE status = \'recorded\' AND expense_date BETWEEN ? AND ?
+             GROUP BY expense_date',
+            [$from, $to]
+        ) as $row) {
+            if (!isset($daily[$row['day']])) {
+                $daily[$row['day']] = [
+                    'day' => $row['day'],
+                    'transactions' => 0,
+                    'revenue' => 0.0,
+                    'cogs' => 0.0,
+                    'gross_profit' => 0.0,
+                    'expenses' => (float) $row['expenses'],
+                ];
+            } else {
+                $daily[$row['day']]['expenses'] = (float) $row['expenses'];
+            }
+        }
+        foreach ($daily as &$row) {
+            $row['net_profit'] = (float) $row['gross_profit'] - (float) $row['expenses'];
+        }
+        unset($row);
+        krsort($daily);
+
         return [
-            'summary' => $this->one(
-                'SELECT COALESCE(SUM(total), 0) AS revenue, COALESCE(SUM(cost_total), 0) AS cogs,
-                    COALESCE(SUM(total - cost_total), 0) AS gross_profit, COUNT(*) AS transactions
-                 FROM sales WHERE DATE(sold_at) BETWEEN ? AND ?',
-                [$from, $to]
-            ),
-            'daily' => $this->all(
-                'SELECT DATE(sold_at) AS day, COUNT(*) AS transactions, SUM(total) AS revenue,
-                    SUM(cost_total) AS cogs, SUM(total - cost_total) AS gross_profit
-                 FROM sales WHERE DATE(sold_at) BETWEEN ? AND ? GROUP BY DATE(sold_at) ORDER BY day DESC',
-                [$from, $to]
-            ),
+            'summary' => $summary,
+            'daily' => array_values($daily),
+            'expenses' => $this->expenses($from, $to),
             'top_products' => $this->all(
                 'SELECT si.product_name, SUM(si.quantity) AS quantity, SUM(si.line_total) AS revenue,
                     SUM(si.line_cost) AS cogs, SUM(si.line_total - si.line_cost) AS gross_profit

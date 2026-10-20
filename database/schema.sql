@@ -91,10 +91,16 @@ CREATE TABLE IF NOT EXISTS purchase_items (
     purchase_id BIGINT UNSIGNED NOT NULL,
     item_type ENUM('ingredient','product') NOT NULL,
     item_id BIGINT UNSIGNED NOT NULL,
+    ingredient_id BIGINT UNSIGNED NULL,
+    product_id BIGINT UNSIGNED NULL,
+    item_name_snapshot VARCHAR(150) NOT NULL,
+    unit_snapshot VARCHAR(30) NOT NULL,
     quantity DECIMAL(14,3) NOT NULL,
     unit_cost DECIMAL(14,2) NOT NULL,
     line_total DECIMAL(14,2) NOT NULL,
     CONSTRAINT fk_purchase_items_purchase FOREIGN KEY (purchase_id) REFERENCES purchases(id) ON DELETE CASCADE,
+    CONSTRAINT fk_purchase_items_ingredient FOREIGN KEY (ingredient_id) REFERENCES ingredients(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_items_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
     INDEX idx_purchase_items_item (item_type, item_id)
 ) ENGINE=InnoDB;
 
@@ -102,6 +108,11 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     item_type ENUM('ingredient','product') NOT NULL,
     item_id BIGINT UNSIGNED NOT NULL,
+    ingredient_id BIGINT UNSIGNED NULL,
+    product_id BIGINT UNSIGNED NULL,
+    user_id BIGINT UNSIGNED NULL,
+    item_name_snapshot VARCHAR(150) NOT NULL,
+    unit_snapshot VARCHAR(30) NOT NULL,
     movement_type ENUM('purchase','sale','adjustment') NOT NULL,
     reference_type VARCHAR(30) NOT NULL,
     reference_id BIGINT UNSIGNED NOT NULL,
@@ -109,8 +120,13 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
     unit_cost DECIMAL(14,2) NOT NULL DEFAULT 0,
     note VARCHAR(255) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_inventory_ingredient FOREIGN KEY (ingredient_id) REFERENCES ingredients(id) ON DELETE SET NULL,
+    CONSTRAINT fk_inventory_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL,
+    CONSTRAINT fk_inventory_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
     INDEX idx_inventory_reference (reference_type, reference_id),
-    INDEX idx_inventory_item (item_type, item_id, created_at)
+    INDEX idx_inventory_item (item_type, item_id, created_at),
+    INDEX idx_inventory_ingredient (ingredient_id, created_at),
+    INDEX idx_inventory_product (product_id, created_at)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS sales (
@@ -136,6 +152,7 @@ CREATE TABLE IF NOT EXISTS sale_items (
     sale_id BIGINT UNSIGNED NOT NULL,
     product_id BIGINT UNSIGNED NOT NULL,
     product_name VARCHAR(150) NOT NULL,
+    unit_snapshot VARCHAR(30) NOT NULL,
     quantity DECIMAL(14,3) NOT NULL,
     unit_price DECIMAL(14,2) NOT NULL,
     unit_cost DECIMAL(14,2) NOT NULL,
@@ -150,12 +167,38 @@ CREATE TABLE IF NOT EXISTS cost_history (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     item_type ENUM('ingredient','product') NOT NULL,
     item_id BIGINT UNSIGNED NOT NULL,
+    ingredient_id BIGINT UNSIGNED NULL,
+    product_id BIGINT UNSIGNED NULL,
+    item_name_snapshot VARCHAR(150) NOT NULL,
     old_cost DECIMAL(14,2) NOT NULL,
     new_cost DECIMAL(14,2) NOT NULL,
     source_type VARCHAR(30) NOT NULL,
     source_id BIGINT UNSIGNED NOT NULL,
     changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_cost_history_item (item_type, item_id, changed_at)
+    CONSTRAINT fk_cost_history_ingredient FOREIGN KEY (ingredient_id) REFERENCES ingredients(id) ON DELETE SET NULL,
+    CONSTRAINT fk_cost_history_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL,
+    INDEX idx_cost_history_item (item_type, item_id, changed_at),
+    INDEX idx_cost_history_ingredient (ingredient_id, changed_at),
+    INDEX idx_cost_history_product (product_id, changed_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS operational_expenses (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT UNSIGNED NOT NULL,
+    expense_date DATE NOT NULL,
+    category VARCHAR(100) NOT NULL,
+    description VARCHAR(255) NOT NULL,
+    amount DECIMAL(14,2) NOT NULL,
+    payment_method ENUM('cash','transfer','qris','debit','other') NOT NULL DEFAULT 'cash',
+    status ENUM('recorded','voided') NOT NULL DEFAULT 'recorded',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    voided_at DATETIME NULL,
+    voided_by BIGINT UNSIGNED NULL,
+    void_note VARCHAR(255) NULL,
+    CONSTRAINT fk_expenses_user FOREIGN KEY (user_id) REFERENCES users(id),
+    CONSTRAINT fk_expenses_voided_by FOREIGN KEY (voided_by) REFERENCES users(id) ON DELETE SET NULL,
+    INDEX idx_expenses_date_status (expense_date, status),
+    INDEX idx_expenses_user (user_id, created_at)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS settings (

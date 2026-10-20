@@ -75,6 +75,7 @@ final class AppController
             'recipes' => ['owner', 'admin'],
             'suppliers' => ['owner', 'admin'],
             'purchases' => ['owner', 'admin'],
+            'expenses' => ['owner', 'admin'],
             'reports' => ['owner', 'admin'],
             'users' => ['owner'],
         ];
@@ -110,21 +111,30 @@ final class AppController
                 $data['ingredients'] = $this->model->all('SELECT id, name, unit, stock, minimum_stock, average_cost FROM ingredients WHERE active = 1 ORDER BY name');
                 $data['movements'] = $this->model->all(
                     "SELECT m.id, m.item_type, m.movement_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
-                        p.name AS item_name, u.name AS actor
-                     FROM inventory_movements m JOIN products p ON m.item_type = 'product' AND p.id = m.item_id
-                     LEFT JOIN users u ON m.reference_type = 'manual' AND u.id = m.reference_id
+                        COALESCE(m.item_name_snapshot, p.name, i.name) AS item_name, u.name AS actor,
+                        m.unit_snapshot
+                     FROM inventory_movements m
+                     LEFT JOIN products p ON p.id = COALESCE(m.product_id, IF(m.item_type = 'product', m.item_id, NULL))
+                     LEFT JOIN ingredients i ON i.id = COALESCE(m.ingredient_id, IF(m.item_type = 'ingredient', m.item_id, NULL))
+                     LEFT JOIN users u ON u.id = COALESCE(m.user_id, IF(m.reference_type = 'manual', m.reference_id, NULL))
+                     WHERE m.item_type = 'product'
                      UNION ALL
                      SELECT m.id, m.item_type, m.movement_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
-                        i.name AS item_name, u.name AS actor
-                     FROM inventory_movements m JOIN ingredients i ON m.item_type = 'ingredient' AND i.id = m.item_id
-                     LEFT JOIN users u ON m.reference_type = 'manual' AND u.id = m.reference_id
+                        COALESCE(m.item_name_snapshot, p.name, i.name) AS item_name, u.name AS actor,
+                        m.unit_snapshot
+                     FROM inventory_movements m
+                     LEFT JOIN products p ON p.id = COALESCE(m.product_id, IF(m.item_type = 'product', m.item_id, NULL))
+                     LEFT JOIN ingredients i ON i.id = COALESCE(m.ingredient_id, IF(m.item_type = 'ingredient', m.item_id, NULL))
+                     LEFT JOIN users u ON u.id = COALESCE(m.user_id, IF(m.reference_type = 'manual', m.reference_id, NULL))
+                     WHERE m.item_type = 'ingredient'
                      ORDER BY created_at DESC LIMIT 50"
                 );
                 $data['cost_history'] = $this->model->all(
                     "SELECT h.item_type, h.old_cost, h.new_cost, h.source_type, h.changed_at,
-                        CASE WHEN h.item_type = 'product' THEN p.name ELSE i.name END AS item_name
-                     FROM cost_history h LEFT JOIN products p ON h.item_type = 'product' AND p.id = h.item_id
-                     LEFT JOIN ingredients i ON h.item_type = 'ingredient' AND i.id = h.item_id
+                        COALESCE(h.item_name_snapshot, p.name, i.name) AS item_name
+                     FROM cost_history h
+                     LEFT JOIN products p ON p.id = COALESCE(h.product_id, IF(h.item_type = 'product', h.item_id, NULL))
+                     LEFT JOIN ingredients i ON i.id = COALESCE(h.ingredient_id, IF(h.item_type = 'ingredient', h.item_id, NULL))
                      ORDER BY h.changed_at DESC LIMIT 30"
                 );
                 break;
@@ -181,6 +191,9 @@ final class AppController
             case 'reports':
                 $data += $this->model->report($from, $to);
                 break;
+            case 'expenses':
+                $data['expenses'] = $this->model->expenses($from, $to);
+                break;
             case 'users':
                 $data['users'] = $this->model->all('SELECT id, name, email, role, active, created_at FROM users ORDER BY name');
                 $data['editing'] = isset($_GET['edit']) ? $this->model->one('SELECT id, name, email, role, active FROM users WHERE id = ?', [(int) $_GET['edit']]) : null;
@@ -216,6 +229,7 @@ final class AppController
         $staffActions = [
             'save_category', 'save_supplier', 'save_ingredient', 'save_product', 'toggle_product',
             'save_recipe', 'create_purchase', 'confirm_purchase', 'cancel_purchase', 'adjust_inventory',
+            'create_expense', 'void_expense',
         ];
         if (in_array($action, $ownerOnly, true)) {
             Auth::requireRole(['owner']);
@@ -347,6 +361,28 @@ final class AppController
                     (int) Auth::user()['id']
                 );
                 $page = 'inventory';
+                break;
+            case 'create_expense':
+                $paymentMethod = (string) input('payment_method');
+                if (!in_array($paymentMethod, ['cash', 'transfer', 'qris', 'debit', 'other'], true)) {
+                    throw new RuntimeException('Metode pembayaran biaya operasional tidak valid.');
+                }
+                $this->model->createExpense([
+                    'expense_date' => $this->requiredDate((string) input('expense_date')),
+                    'category' => $this->requiredText('category', 100),
+                    'description' => $this->requiredText('description', 255),
+                    'amount' => $this->number('amount'),
+                    'payment_method' => $paymentMethod,
+                ], (int) Auth::user()['id']);
+                $page = 'expenses';
+                break;
+            case 'void_expense':
+                $this->model->voidExpense(
+                    (int) input('id'),
+                    $this->requiredText('void_note', 255),
+                    (int) Auth::user()['id']
+                );
+                $page = 'expenses';
                 break;
             case 'create_sale':
                 $ids = is_array($_POST['product_id'] ?? null) ? $_POST['product_id'] : [];
@@ -493,6 +529,7 @@ final class AppController
             'recipes' => 'Resep & HPP',
             'suppliers' => 'Supplier',
             'purchases' => 'Pembelian & stok',
+            'expenses' => 'Biaya operasional',
             'pos' => 'Kasir / POS',
             'sales' => 'Transaksi penjualan',
             'reports' => 'Laporan usaha',
