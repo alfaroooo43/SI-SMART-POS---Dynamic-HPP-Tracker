@@ -10,7 +10,7 @@ $authPages = ['login', 'setup'];
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#166534">
-    <title><?= e($title ?? 'SI SMART POS') ?> · SMART POS</title>
+    <title><?= e($title ?? 'SI SMART UMKM') ?> · SMART UMKM</title>
     <link rel="stylesheet" href="<?= $assetPrefix ?>/app.css">
 </head>
 <body class="<?= in_array($view, $authPages, true) ? 'auth-body' : '' ?>">
@@ -24,33 +24,57 @@ $authPages = ['login', 'setup'];
 <?php else: ?>
     <div class="app-shell">
         <aside class="sidebar">
-            <a class="brand" href="?page=dashboard"><span class="brand-mark">S</span><span>SMART<span class="brand-light">POS</span><small>UMKM MANAGEMENT</small></span></a>
+            <a class="brand" href="?page=dashboard"><span class="brand-mark">S</span><span>SMART<span class="brand-light">UMKM</span><small><?= e(($business_profile['business_name'] ?? '') ?: 'PENGELOLAAN USAHA') ?></small></span></a>
             <div class="sidebar-label">MENU UTAMA</div>
             <nav class="nav-menu" aria-label="Navigasi utama">
                 <?php
-                $menu = [
-                    ['dashboard', '◫', 'Dashboard', ['owner', 'admin', 'cashier']],
-                    ['pos', '＋', 'Kasir / POS', ['owner', 'admin', 'cashier']],
-                    ['sales', '▤', 'Transaksi', ['owner', 'admin', 'cashier']],
-                    ['products', '▦', 'Produk', ['owner', 'admin']],
-                    ['ingredients', '◉', 'Bahan baku', ['owner', 'admin']],
-                    ['inventory', '⇵', 'Persediaan', ['owner', 'admin']],
-                    ['recipes', '♧', 'Resep & HPP', ['owner', 'admin']],
-                    ['suppliers', '⇄', 'Supplier', ['owner', 'admin']],
-                    ['purchases', '▣', 'Pembelian & stok', ['owner', 'admin']],
-                    ['expenses', '−', 'Biaya operasional', ['owner', 'admin']],
+                $role = $user['role'] ?? '';
+                $singleLinks = [
+                    ['dashboard', '◫', 'Dashboard', ['owner', 'admin']],
                     ['reports', '▥', 'Laporan', ['owner', 'admin']],
-                    ['users', '♙', 'Pengguna', ['owner']],
                 ];
-                foreach ($menu as [$slug, $icon, $label, $roles]):
-                    if (!in_array($user['role'] ?? '', $roles, true)) {
-                        continue;
-                    }
+                $menuGroups = [
+                    ['Master Data', [
+                        ['products', '▦', 'Produk', ['owner', 'admin']],
+                        ['ingredients', '◉', 'Bahan baku', ['owner', 'admin']],
+                        ['suppliers', '⇄', 'Supplier', ['owner', 'admin']],
+                    ]],
+                    ['Persediaan', [
+                        ['inventory', '⇵', 'Stok & riwayat', ['owner', 'admin']],
+                    ]],
+                    ['Keuangan', [
+                        ['recipes', '♧', 'HPP & resep', ['owner', 'admin']],
+                        ['expenses', '−', 'Biaya operasional', ['owner', 'admin']],
+                    ]],
+                    ['Pengaturan', [
+                        ['settings', '⚙', 'Profil usaha', ['owner']],
+                        ['users', '♙', 'Pengguna & akses', ['owner']],
+                    ]],
+                ];
                 ?>
-                    <a class="nav-link <?= ($page ?? '') === $slug ? 'active' : '' ?>" href="?page=<?= e($slug) ?>">
-                        <span class="nav-icon"><?= e($icon) ?></span><?= e($label) ?>
-                    </a>
-                <?php endforeach; ?>
+                    <?php foreach ($singleLinks as [$slug, $icon, $label, $roles]): if (in_array($role, $roles, true)): ?>
+                        <a class="nav-link <?= ($page ?? '') === $slug ? 'active' : '' ?>" href="?page=<?= e($slug) ?>">
+                            <span class="nav-icon"><?= e($icon) ?></span><?= e($label) ?>
+                        </a>
+                    <?php endif; endforeach; ?>
+                    <?php foreach ($menuGroups as [$groupLabel, $items]):
+                        $visibleItems = array_values(array_filter($items, static fn (array $item): bool => in_array($role, $item[3], true)));
+                        if (!$visibleItems) {
+                            continue;
+                        }
+                        $groupActive = in_array($page ?? '', array_column($visibleItems, 0), true);
+                    ?>
+                        <details class="nav-group" <?= $groupActive ? 'open' : '' ?>>
+                            <summary class="nav-group-summary"><?= e($groupLabel) ?><span class="nav-chevron" aria-hidden="true"></span></summary>
+                            <div class="nav-submenu">
+                                <?php foreach ($visibleItems as [$slug, $icon, $label]): ?>
+                                    <a class="nav-link <?= ($page ?? '') === $slug ? 'active' : '' ?>" href="?page=<?= e($slug) ?>">
+                                        <span class="nav-icon"><?= e($icon) ?></span><?= e($label) ?>
+                                    </a>
+                                <?php endforeach; ?>
+                            </div>
+                        </details>
+                    <?php endforeach; ?>
             </nav>
             <div class="sidebar-bottom">
                 <div class="support-card"><span class="support-icon">✦</span><strong>Bisnis lebih terukur</strong><p>Pantau biaya dan keuntungan usaha dalam satu tempat.</p></div>
@@ -59,7 +83,7 @@ $authPages = ['login', 'setup'];
         </aside>
         <main class="main-area">
             <header class="topbar">
-                <div><span class="eyebrow">SI SMART POS & DYNAMIC HPP TRACKER</span><h1><?= e($title ?? '') ?></h1></div>
+                <div><span class="eyebrow">PENGELOLAAN PRODUK, STOK, HPP & KEUANGAN UMKM</span><h1><?= e($title ?? '') ?></h1></div>
                 <div class="topbar-actions"><span class="today"><?= e(format_date(date('Y-m-d'), 'l, d M Y')) ?></span>
                     <form method="post" class="inline-form">
                         <input type="hidden" name="_csrf" value="<?= e(\App\Core\Csrf::token()) ?>">
@@ -73,7 +97,7 @@ $authPages = ['login', 'setup'];
                     <div class="notice notice-<?= e($flashMessage['type']) ?>" role="status"><?= e($flashMessage['message']) ?></div>
                 <?php endif; ?>
                 <?php require APP_ROOT . '/app/Views/pages/' . $view . '.php'; ?>
-                <footer class="footer">© <?= date('Y') ?> SMART POS <span>·</span> Pencatatan usaha yang lebih cerdas</footer>
+                <footer class="footer">© <?= date('Y') ?> SMART UMKM <span>·</span> Pencatatan usaha yang lebih cerdas</footer>
             </div>
         </main>
     </div>

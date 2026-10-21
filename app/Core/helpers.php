@@ -11,6 +11,13 @@ function rupiah(float|int|string|null $amount): string
     return 'Rp ' . number_format((float) $amount, 0, ',', '.');
 }
 
+function format_quantity(float|int|string|null $quantity): string
+{
+    $formatted = number_format((float) $quantity, 3, ',', '.');
+    $formatted = rtrim(rtrim($formatted, '0'), ',');
+    return $formatted === '-0' ? '0' : $formatted;
+}
+
 function redirect(string $url): never
 {
     header('Location: ' . $url);

@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 return [
-    'app_name' => 'SI SMART POS',
+    'app_name' => 'SI SMART UMKM',
     'timezone' => 'Asia/Jakarta',
     'database' => [
         'host' => getenv('DB_HOST') ?: 'localhost',

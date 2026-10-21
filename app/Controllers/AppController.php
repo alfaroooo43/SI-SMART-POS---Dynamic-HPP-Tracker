@@ -32,19 +32,31 @@ final class AppController
             }
             $this->handleGet((string) ($_GET['page'] ?? 'dashboard'));
         } catch (Throwable $exception) {
+            $returnUrl = null;
+            if (($_POST['action'] ?? '') === 'save_recipe' && Auth::check()) {
+                $ingredientIds = is_array($_POST['ingredient_id'] ?? null) ? array_slice($_POST['ingredient_id'], 0, 12) : [];
+                $quantities = is_array($_POST['quantity'] ?? null) ? array_slice($_POST['quantity'], 0, 12) : [];
+                $_SESSION['recipe_form'] = [
+                    'product_id' => (int) ($_POST['product_id'] ?? 0),
+                    'yield_quantity' => is_scalar($_POST['yield_quantity'] ?? null) ? (string) $_POST['yield_quantity'] : '',
+                    'ingredient_id' => array_map(static fn ($id): string => is_scalar($id) ? (string) $id : '0', $ingredientIds),
+                    'quantity' => array_map(static fn ($quantity): string => is_scalar($quantity) ? (string) $quantity : '', $quantities),
+                ];
+                $returnUrl = '?page=recipes&product_id=' . max(0, (int) ($_POST['product_id'] ?? 0));
+            }
             if ($exception instanceof PDOException) {
-                error_log('SMART POS database operation failed: ' . $exception->getMessage());
+                error_log('SMART UMKM database operation failed: ' . $exception->getMessage());
                 flash('error', 'Data tidak dapat disimpan. Periksa kembali input dan koneksi database.');
             } elseif ($exception instanceof RuntimeException) {
                 flash('error', $exception->getMessage());
             } else {
-                error_log('SMART POS error: ' . $exception);
+                error_log('SMART UMKM error: ' . $exception);
                 flash('error', 'Terjadi kesalahan saat memproses permintaan. Silakan coba kembali.');
             }
             $page = ($_POST['action'] ?? '') === 'setup'
                 ? 'setup'
                 : (Auth::check() ? (string) ($_POST['return_page'] ?? 'dashboard') : 'login');
-            redirect('?page=' . rawurlencode($page));
+            redirect($returnUrl ?? '?page=' . rawurlencode($page));
         }
     }
 
@@ -58,7 +70,10 @@ final class AppController
             if (Auth::check()) {
                 redirect('?page=dashboard');
             }
-            $this->render('login', ['title' => 'Masuk']);
+            $this->render('login', [
+                'title' => 'Masuk',
+                'registrationOpen' => (int) $this->model->scalar('SELECT COUNT(*) FROM users') === 0,
+            ]);
             return;
         }
         if (!Auth::check()) {
@@ -66,18 +81,16 @@ final class AppController
         }
 
         $allowed = [
-            'dashboard' => ['owner', 'admin', 'cashier'],
-            'pos' => ['owner', 'admin', 'cashier'],
-            'sales' => ['owner', 'admin', 'cashier'],
+            'dashboard' => ['owner', 'admin'],
             'products' => ['owner', 'admin'],
             'ingredients' => ['owner', 'admin'],
             'inventory' => ['owner', 'admin'],
             'recipes' => ['owner', 'admin'],
             'suppliers' => ['owner', 'admin'],
-            'purchases' => ['owner', 'admin'],
             'expenses' => ['owner', 'admin'],
             'reports' => ['owner', 'admin'],
             'users' => ['owner'],
+            'settings' => ['owner'],
         ];
         if (!isset($allowed[$page])) {
             $page = 'dashboard';
@@ -91,14 +104,26 @@ final class AppController
             [$from, $to] = [$to, $from];
         }
         $data = ['title' => $this->title($page), 'page' => $page, 'from' => $from, 'to' => $to];
+        $data['business_profile'] = $this->model->settings();
 
         switch ($page) {
             case 'dashboard':
                 $data += $this->model->dashboard($from, $to);
                 break;
             case 'products':
-                $data['products'] = $this->model->products();
                 $data['categories'] = $this->model->all('SELECT * FROM categories ORDER BY name');
+                $data['product_search'] = mb_substr(trim((string) ($_GET['q'] ?? '')), 0, 100);
+                $categoryFilter = filter_var($_GET['category_id'] ?? '', FILTER_VALIDATE_INT);
+                $data['product_category_filter'] = $categoryFilter && $categoryFilter > 0 ? $categoryFilter : null;
+                $data['product_status_filter'] = in_array($_GET['status'] ?? '', ['active', 'archived'], true) ? (string) $_GET['status'] : '';
+                $data['product_type_filter'] = in_array($_GET['type'] ?? '', ['retail', 'culinary'], true) ? (string) $_GET['type'] : '';
+                $data['products'] = $this->model->products(
+                    false,
+                    $data['product_search'],
+                    $data['product_category_filter'],
+                    $data['product_status_filter'] ?: null,
+                    $data['product_type_filter'] ?: null
+                );
                 $data['editing'] = isset($_GET['edit']) ? $this->model->one('SELECT * FROM products WHERE id = ?', [(int) $_GET['edit']]) : null;
                 $data['category_edit'] = isset($_GET['edit_category']) ? $this->model->one('SELECT * FROM categories WHERE id = ?', [(int) $_GET['edit_category']]) : null;
                 break;
@@ -109,8 +134,15 @@ final class AppController
             case 'inventory':
                 $data['products'] = $this->model->all("SELECT id, name, unit, stock, minimum_stock, average_cost FROM products WHERE active = 1 AND type = 'retail' ORDER BY name");
                 $data['ingredients'] = $this->model->all('SELECT id, name, unit, stock, minimum_stock, average_cost FROM ingredients WHERE active = 1 ORDER BY name');
+                $data['stock_items'] = $this->model->all(
+                    "SELECT id, 'product' AS item_type, name, unit, stock, average_cost FROM products
+                     WHERE active = 1 AND type = 'retail'
+                     UNION ALL
+                     SELECT id, 'ingredient' AS item_type, name, unit, stock, average_cost FROM ingredients
+                     WHERE active = 1 ORDER BY name"
+                );
                 $data['movements'] = $this->model->all(
-                    "SELECT m.id, m.item_type, m.movement_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
+                    "SELECT m.id, m.item_type, m.movement_type, m.reference_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
                         COALESCE(m.item_name_snapshot, p.name, i.name) AS item_name, u.name AS actor,
                         m.unit_snapshot
                      FROM inventory_movements m
@@ -119,7 +151,7 @@ final class AppController
                      LEFT JOIN users u ON u.id = COALESCE(m.user_id, IF(m.reference_type = 'manual', m.reference_id, NULL))
                      WHERE m.item_type = 'product'
                      UNION ALL
-                     SELECT m.id, m.item_type, m.movement_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
+                     SELECT m.id, m.item_type, m.movement_type, m.reference_type, m.quantity_change, m.unit_cost, m.note, m.created_at,
                         COALESCE(m.item_name_snapshot, p.name, i.name) AS item_name, u.name AS actor,
                         m.unit_snapshot
                      FROM inventory_movements m
@@ -128,6 +160,13 @@ final class AppController
                      LEFT JOIN users u ON u.id = COALESCE(m.user_id, IF(m.reference_type = 'manual', m.reference_id, NULL))
                      WHERE m.item_type = 'ingredient'
                      ORDER BY created_at DESC LIMIT 50"
+                );
+                $data['movement_audits'] = $this->model->all(
+                    'SELECT a.action, a.item_name_snapshot, a.unit_snapshot, a.quantity_change, a.note,
+                            a.created_at, a.changed_at, u.name AS changed_by
+                     FROM inventory_movement_audit a
+                     LEFT JOIN users u ON u.id = a.changed_by
+                     ORDER BY a.changed_at DESC, a.id DESC LIMIT 25'
                 );
                 $data['cost_history'] = $this->model->all(
                     "SELECT h.item_type, h.old_cost, h.new_cost, h.source_type, h.changed_at,
@@ -142,6 +181,12 @@ final class AppController
                 $data['products'] = $this->model->all("SELECT * FROM products WHERE active = 1 AND type = 'culinary' ORDER BY name");
                 $data['ingredients'] = $this->model->all('SELECT * FROM ingredients WHERE active = 1 ORDER BY name');
                 $data['selected_id'] = (int) ($_GET['product_id'] ?? 0);
+                $data['recipe_form'] = null;
+                if (isset($_SESSION['recipe_form'])
+                    && (int) $_SESSION['recipe_form']['product_id'] === $data['selected_id']) {
+                    $data['recipe_form'] = $_SESSION['recipe_form'];
+                    unset($_SESSION['recipe_form']);
+                }
                 $data['recipe'] = $data['selected_id'] ? $this->model->one(
                     'SELECT r.*, ri.ingredient_id, ri.quantity FROM recipes r
                      LEFT JOIN recipe_items ri ON ri.recipe_id = r.id WHERE r.product_id = ?',
@@ -161,42 +206,19 @@ final class AppController
                 $data['suppliers'] = $this->model->all('SELECT * FROM suppliers ORDER BY name');
                 $data['editing'] = isset($_GET['edit']) ? $this->model->one('SELECT * FROM suppliers WHERE id = ?', [(int) $_GET['edit']]) : null;
                 break;
-            case 'purchases':
-                $data['suppliers'] = $this->model->all('SELECT * FROM suppliers WHERE active = 1 ORDER BY name');
-                $data['ingredients'] = $this->model->all('SELECT * FROM ingredients WHERE active = 1 ORDER BY name');
-                $data['retail_products'] = $this->model->all("SELECT * FROM products WHERE active = 1 AND type = 'retail' ORDER BY name");
-                $data['purchases'] = $this->model->all(
-                    'SELECT p.*, s.name AS supplier, u.name AS created_by FROM purchases p
-                     JOIN suppliers s ON s.id = p.supplier_id JOIN users u ON u.id = p.user_id ORDER BY p.id DESC LIMIT 50'
-                );
-                break;
-            case 'pos':
-                $data['products'] = $this->model->products(true);
-                $data['preview'] = $_SESSION['pos_preview'] ?? null;
-                break;
-            case 'sales':
-                $user = Auth::user();
-                $condition = $user['role'] === 'cashier' ? 'WHERE s.user_id = ?' : '';
-                $params = $user['role'] === 'cashier' ? [$user['id']] : [];
-                $data['sales'] = $this->model->all(
-                    "SELECT s.*, u.name AS cashier FROM sales s JOIN users u ON u.id = s.user_id $condition ORDER BY s.sold_at DESC LIMIT 100",
-                    $params
-                );
-                if (isset($_GET['id'])) {
-                    $sale = $this->model->one("SELECT s.*, u.name AS cashier FROM sales s JOIN users u ON u.id = s.user_id WHERE s.id = ?" . ($user['role'] === 'cashier' ? ' AND s.user_id = ?' : ''), $user['role'] === 'cashier' ? [(int) $_GET['id'], $user['id']] : [(int) $_GET['id']]);
-                    $data['selected_sale'] = $sale;
-                    $data['sale_items'] = $sale ? $this->model->all('SELECT * FROM sale_items WHERE sale_id = ?', [$sale['id']]) : [];
-                }
-                break;
             case 'reports':
                 $data += $this->model->report($from, $to);
                 break;
             case 'expenses':
-                $data['expenses'] = $this->model->expenses($from, $to);
+                $data['expense_search'] = mb_substr(trim((string) ($_GET['q'] ?? '')), 0, 100);
+                $data['expenses'] = $this->model->expenses($from, $to, $data['expense_search']);
                 break;
             case 'users':
                 $data['users'] = $this->model->all('SELECT id, name, email, role, active, created_at FROM users ORDER BY name');
                 $data['editing'] = isset($_GET['edit']) ? $this->model->one('SELECT id, name, email, role, active FROM users WHERE id = ?', [(int) $_GET['edit']]) : null;
+                break;
+            case 'settings':
+                $data['settings'] = $this->model->settings();
                 break;
         }
         $this->render($page, $data);
@@ -225,26 +247,30 @@ final class AppController
             redirect('?page=login');
         }
         $page = (string) input('return_page', 'dashboard');
-        $ownerOnly = ['save_user', 'toggle_user'];
+        $ownerOnly = ['save_user', 'toggle_user', 'save_settings'];
         $staffActions = [
-            'save_category', 'save_supplier', 'save_ingredient', 'save_product', 'toggle_product',
-            'save_recipe', 'create_purchase', 'confirm_purchase', 'cancel_purchase', 'adjust_inventory',
+            'save_category', 'delete_category', 'save_supplier', 'toggle_supplier', 'delete_supplier', 'save_ingredient', 'toggle_ingredient', 'delete_ingredient',
+            'save_product', 'toggle_product', 'delete_product', 'save_recipe', 'delete_recipe_ingredient', 'adjust_inventory',
+            'set_inventory_stock', 'update_inventory_movement', 'delete_inventory_movement',
             'create_expense', 'void_expense',
         ];
         if (in_array($action, $ownerOnly, true)) {
             Auth::requireRole(['owner']);
         } elseif (in_array($action, $staffActions, true)) {
             Auth::requireRole(['owner', 'admin']);
-        } elseif (in_array($action, ['create_sale', 'preview_sale', 'clear_sale_preview'], true)) {
-            Auth::requireRole(['owner', 'admin', 'cashier']);
         } else {
             throw new RuntimeException('Tindakan tidak dikenal.');
         }
 
+        $query = '';
         switch ($action) {
             case 'save_category':
                 $name = $this->requiredText('name', 100);
                 $this->model->saveCategory($this->optionalId('id'), $name);
+                $page = 'products';
+                break;
+            case 'delete_category':
+                $this->model->deleteCategory((int) input('id'));
                 $page = 'products';
                 break;
             case 'save_supplier':
@@ -255,12 +281,33 @@ final class AppController
                 ]);
                 $page = 'suppliers';
                 break;
+            case 'toggle_supplier':
+                $this->model->setSupplierActive((int) input('id'), $this->toggleValue('active'));
+                $page = 'suppliers';
+                break;
+            case 'delete_supplier':
+                $this->model->deleteSupplier((int) input('id'));
+                $page = 'suppliers';
+                break;
             case 'save_ingredient':
+                $averageCost = input('average_cost');
+                if (!is_string($averageCost) || trim($averageCost) === '') {
+                    throw new RuntimeException('Harga beli per satuan dasar wajib diisi. Masukkan 0 hanya jika biaya memang belum tersedia.');
+                }
                 $this->model->saveIngredient($this->optionalId('id'), [
                     'name' => $this->requiredText('name', 150),
                     'unit' => $this->requiredText('unit', 30),
-                    'minimum_stock' => $this->number('minimum_stock'),
+                    'average_cost' => $this->number('average_cost'),
+                    'minimum_stock' => $this->quantity('minimum_stock'),
                 ]);
+                $page = 'ingredients';
+                break;
+            case 'toggle_ingredient':
+                $this->model->setIngredientActive((int) input('id'), $this->toggleValue('active'));
+                $page = 'ingredients';
+                break;
+            case 'delete_ingredient':
+                $this->model->deleteIngredient((int) input('id'));
                 $page = 'ingredients';
                 break;
             case 'save_product':
@@ -274,83 +321,69 @@ final class AppController
                     'type' => $type,
                     'unit' => $this->requiredText('unit', 30),
                     'selling_price' => $this->number('selling_price'),
-                    'minimum_stock' => $this->number('minimum_stock'),
+                    'minimum_stock' => $this->quantity('minimum_stock'),
                     'min_margin' => $this->boundedNumber('min_margin', 0, 99),
                     'target_margin' => $this->boundedNumber('target_margin', 0, 99),
                 ]);
                 $page = 'products';
                 break;
             case 'toggle_product':
-                $this->model->setProductActive((int) input('id'), input('active') === '1');
+                $this->model->setProductActive((int) input('id'), $this->toggleValue('active'));
+                $page = 'products';
+                break;
+            case 'delete_product':
+                $this->model->deleteProduct((int) input('id'));
                 $page = 'products';
                 break;
             case 'save_recipe':
-                $productId = (int) input('product_id');
+                $productId = filter_var(input('product_id'), FILTER_VALIDATE_INT);
+                if ($productId === false || $productId <= 0) {
+                    throw new RuntimeException('Pilih produk kuliner sebelum menyimpan resep.');
+                }
                 $ingredients = is_array($_POST['ingredient_id'] ?? null) ? $_POST['ingredient_id'] : [];
                 $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
                 $items = [];
                 foreach ($ingredients as $index => $id) {
-                    $quantity = $this->parseNumber($quantities[$index] ?? '');
-                    if (!is_finite($quantity)) {
-                        throw new RuntimeException('Jumlah bahan resep harus berupa angka yang valid.');
+                    $ingredientId = filter_var($id, FILTER_VALIDATE_INT);
+                    $rawQuantity = $quantities[$index] ?? '';
+                    $hasQuantity = is_scalar($rawQuantity) && trim((string) $rawQuantity) !== '';
+                    if ($ingredientId === false || $ingredientId < 0) {
+                        throw new RuntimeException('Pilihan bahan resep pada baris ' . ((int) $index + 1) . ' tidak valid.');
                     }
-                    if ((int) $id > 0 && $quantity > 0) {
-                        $items[(int) $id] = $quantity;
-                    } elseif ((int) $id > 0) {
-                        throw new RuntimeException('Setiap bahan resep yang dipilih harus memiliki jumlah lebih dari nol.');
-                    }
-                }
-                $this->model->saveRecipe($productId, $this->number('yield_quantity'), $items);
-                $page = 'recipes';
-                break;
-            case 'create_purchase':
-                $refs = is_array($_POST['item_ref'] ?? null) ? $_POST['item_ref'] : [];
-                $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
-                $costs = is_array($_POST['unit_cost'] ?? null) ? $_POST['unit_cost'] : [];
-                $lines = [];
-                foreach ($refs as $index => $ref) {
-                    if ($ref === '') {
+                    if ($ingredientId === 0) {
+                        if ($hasQuantity) {
+                            throw new RuntimeException('Pilih bahan baku pada baris ' . ((int) $index + 1) . ' atau kosongkan jumlahnya.');
+                        }
                         continue;
                     }
-                    $parts = explode(':', (string) $ref, 2);
-                    if (trim((string) ($quantities[$index] ?? '')) === '' || trim((string) ($costs[$index] ?? '')) === '') {
-                        throw new RuntimeException('Lengkapi kuantitas dan biaya untuk setiap barang pembelian yang dipilih.');
+                    $quantity = $this->recipeQuantityValue($rawQuantity, 'Jumlah bahan pada baris ' . ((int) $index + 1));
+                    if (isset($items[$ingredientId])) {
+                        throw new RuntimeException('Bahan yang sama dipilih lebih dari sekali. Gabungkan jumlahnya dalam satu baris.');
                     }
-                    $quantity = $this->parseNumber($quantities[$index] ?? '');
-                    $unitCost = $this->parseNumber($costs[$index] ?? '');
-                    if (!is_finite($quantity) || !is_finite($unitCost) || $quantity <= 0 || $unitCost < 0) {
-                        throw new RuntimeException('Setiap baris pembelian terpilih harus memiliki kuantitas lebih dari nol dan biaya yang valid.');
-                    }
-                    $lines[] = [
-                        'item_type' => $parts[0] ?? '',
-                        'item_id' => (int) ($parts[1] ?? 0),
-                        'quantity' => $quantity,
-                        'unit_cost' => $unitCost,
-                    ];
+                    $items[$ingredientId] = $quantity;
                 }
-                $id = $this->model->createPurchase([
-                    'supplier_id' => (int) input('supplier_id'),
-                    'invoice_number' => $this->optionalText('invoice_number', 100),
-                    'purchased_at' => $this->requiredDate((string) input('purchased_at')),
-                ], $lines, (int) Auth::user()['id']);
-                flash('success', "Pembelian #$id tersimpan sebagai draft. Konfirmasikan untuk memperbarui stok.");
-                $page = 'purchases';
+                $yield = $this->recipeQuantityValue(input('yield_quantity'), 'Hasil produksi');
+                $this->model->saveRecipe($productId, $yield, $items);
+                unset($_SESSION['recipe_form']);
+                $page = 'recipes';
+                $query = '&product_id=' . $productId;
                 break;
-            case 'confirm_purchase':
-                $this->model->confirmPurchase((int) input('id'));
-                flash('success', 'Pembelian dikonfirmasi dan stok serta biaya rata-rata telah diperbarui.');
-                $page = 'purchases';
-                break;
-            case 'cancel_purchase':
-                $this->model->cancelPurchase((int) input('id'));
-                $page = 'purchases';
+            case 'delete_recipe_ingredient':
+                $productId = filter_var(input('product_id'), FILTER_VALIDATE_INT);
+                $ingredientId = filter_var(input('ingredient_id'), FILTER_VALIDATE_INT);
+                if ($productId === false || $productId <= 0 || $ingredientId === false || $ingredientId <= 0) {
+                    throw new RuntimeException('Produk atau bahan resep yang dipilih tidak valid.');
+                }
+                $this->model->deleteRecipeIngredient($productId, $ingredientId);
+                $page = 'recipes';
+                $query = '&product_id=' . $productId;
                 break;
             case 'adjust_inventory':
                 $itemRef = explode(':', (string) input('item_ref'), 2);
                 $type = $itemRef[0] ?? '';
-                $itemId = (int) ($itemRef[1] ?? 0);
-                $delta = $this->parseNumber(input('quantity_change'));
-                if (!is_finite($delta) || $delta == 0) {
+                $itemId = filter_var($itemRef[1] ?? '', FILTER_VALIDATE_INT);
+                $delta = $this->quantity('quantity_change', true);
+                if ($itemId === false || $itemId <= 0 || $delta == 0.0) {
                     throw new RuntimeException('Masukkan penyesuaian stok positif untuk menambah atau negatif untuk mengurangi.');
                 }
                 $this->model->adjustInventory(
@@ -362,14 +395,56 @@ final class AppController
                 );
                 $page = 'inventory';
                 break;
+            case 'set_inventory_stock':
+                $itemRef = explode(':', (string) input('item_ref'), 2);
+                $type = $itemRef[0] ?? '';
+                $itemId = filter_var($itemRef[1] ?? '', FILTER_VALIDATE_INT);
+                if ($itemId === false || $itemId <= 0) {
+                    throw new RuntimeException('Pilih barang atau bahan baku yang valid.');
+                }
+                $this->model->setInventoryStock(
+                    $type,
+                    $itemId,
+                    $this->quantity('stock'),
+                    $this->requiredText('note', 255),
+                    (int) Auth::user()['id']
+                );
+                $page = 'inventory';
+                break;
+            case 'update_inventory_movement':
+                $movementId = filter_var(input('id'), FILTER_VALIDATE_INT);
+                if ($movementId === false || $movementId <= 0) {
+                    throw new RuntimeException('Mutasi stok yang dipilih tidak valid.');
+                }
+                $this->model->updateInventoryMovement(
+                    $movementId,
+                    $this->quantity('quantity_change', true),
+                    $this->requiredText('note', 255),
+                    $this->dateTimeLocal((string) input('created_at')),
+                    (int) Auth::user()['id']
+                );
+                $page = 'inventory';
+                break;
+            case 'delete_inventory_movement':
+                $movementId = filter_var(input('id'), FILTER_VALIDATE_INT);
+                if ($movementId === false || $movementId <= 0) {
+                    throw new RuntimeException('Mutasi stok yang dipilih tidak valid.');
+                }
+                $this->model->deleteInventoryMovement($movementId, (int) Auth::user()['id']);
+                $page = 'inventory';
+                break;
             case 'create_expense':
                 $paymentMethod = (string) input('payment_method');
                 if (!in_array($paymentMethod, ['cash', 'transfer', 'qris', 'debit', 'other'], true)) {
                     throw new RuntimeException('Metode pembayaran biaya operasional tidak valid.');
                 }
+                $expenseCategory = (string) input('category');
+                if (!in_array($expenseCategory, ['Listrik & air', 'Sewa', 'Transportasi', 'Gaji', 'Perlengkapan', 'Internet & telepon', 'Perawatan', 'Biaya lainnya'], true)) {
+                    throw new RuntimeException('Pilih jenis biaya operasional yang tersedia.');
+                }
                 $this->model->createExpense([
                     'expense_date' => $this->requiredDate((string) input('expense_date')),
-                    'category' => $this->requiredText('category', 100),
+                    'category' => $expenseCategory,
                     'description' => $this->requiredText('description', 255),
                     'amount' => $this->number('amount'),
                     'payment_method' => $paymentMethod,
@@ -384,76 +459,9 @@ final class AppController
                 );
                 $page = 'expenses';
                 break;
-            case 'create_sale':
-                $ids = is_array($_POST['product_id'] ?? null) ? $_POST['product_id'] : [];
-                $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
-                $cart = [];
-                foreach ($ids as $index => $id) {
-                    $id = (int) $id;
-                    $quantity = $this->parseNumber($quantities[$index] ?? '');
-                    if (!is_finite($quantity)) {
-                        throw new RuntimeException('Kuantitas transaksi harus berupa angka yang valid.');
-                    }
-                    if ($quantity < 0) {
-                        throw new RuntimeException('Kuantitas produk tidak boleh negatif.');
-                    }
-                    if ($id > 0 && $quantity > 0) {
-                        $cart[$id] = ($cart[$id] ?? 0) + $quantity;
-                    } elseif ($id > 0) {
-                        throw new RuntimeException('Kuantitas setiap produk yang dipilih harus lebih dari nol.');
-                    } elseif ($quantity > 0) {
-                        throw new RuntimeException('Pilih produk untuk setiap kuantitas yang dimasukkan.');
-                    }
-                }
-                $saleId = $this->model->createSale(
-                    $cart,
-                    $this->number('discount'),
-                    $this->number('amount_paid'),
-                    (string) input('payment_method'),
-                    (int) Auth::user()['id'],
-                    (string) input('checkout_token')
-                );
-                unset($_SESSION['pos_preview']);
-                flash('success', 'Transaksi berhasil disimpan dengan nomor ' . $this->model->scalar('SELECT receipt_number FROM sales WHERE id = ?', [$saleId]) . '.');
-                redirect('?page=sales&id=' . $saleId);
-            case 'preview_sale':
-                $ids = is_array($_POST['product_id'] ?? null) ? $_POST['product_id'] : [];
-                $quantities = is_array($_POST['quantity'] ?? null) ? $_POST['quantity'] : [];
-                $cart = [];
-                foreach ($ids as $index => $id) {
-                    $id = (int) $id;
-                    $quantity = $this->parseNumber($quantities[$index] ?? '');
-                    if (!is_finite($quantity)) {
-                        throw new RuntimeException('Kuantitas transaksi harus berupa angka yang valid.');
-                    }
-                    if ($quantity < 0) {
-                        throw new RuntimeException('Kuantitas produk tidak boleh negatif.');
-                    }
-                    if ($id > 0 && $quantity > 0) {
-                        $cart[$id] = ($cart[$id] ?? 0) + $quantity;
-                    } elseif ($id > 0) {
-                        throw new RuntimeException('Kuantitas setiap produk yang dipilih harus lebih dari nol.');
-                    } elseif ($quantity > 0) {
-                        throw new RuntimeException('Pilih produk untuk setiap kuantitas yang dimasukkan.');
-                    }
-                }
-                $discount = $this->number('discount');
-                $preview = $this->model->previewSale($cart, $discount);
-                $_SESSION['pos_preview'] = [
-                    'quantities' => $cart,
-                    'discount' => $discount,
-                    'checkout_token' => bin2hex(random_bytes(32)),
-                    'payment_method' => in_array(input('payment_method'), ['cash', 'transfer', 'qris', 'debit'], true) ? input('payment_method') : 'cash',
-                    'data' => $preview,
-                ];
-                flash('success', 'Periksa ringkasan transaksi sebelum menyimpan pembayaran.');
-                redirect('?page=pos');
-            case 'clear_sale_preview':
-                unset($_SESSION['pos_preview']);
-                redirect('?page=pos');
             case 'save_user':
                 $role = (string) input('role');
-                if (!in_array($role, ['admin', 'cashier'], true)) {
+                if ($role !== 'admin') {
                     throw new RuntimeException('Peran pengguna tidak valid.');
                 }
                 $this->model->saveUser($this->optionalId('id'), [
@@ -465,20 +473,29 @@ final class AppController
                 $page = 'users';
                 break;
             case 'toggle_user':
-                $this->model->setUserActive((int) input('id'), input('active') === '1', (int) Auth::user()['id']);
+                $this->model->setUserActive((int) input('id'), $this->toggleValue('active'), (int) Auth::user()['id']);
                 $page = 'users';
+                break;
+            case 'save_settings':
+                $this->model->saveSettings([
+                    'business_name' => $this->optionalText('business_name', 120),
+                    'business_phone' => $this->optionalText('business_phone', 120),
+                    'business_address' => $this->optionalText('business_address', 255),
+                ]);
+                $page = 'settings';
                 break;
         }
         flash('success', 'Perubahan berhasil disimpan.');
-        redirect('?page=' . rawurlencode($page));
+        redirect('?page=' . rawurlencode($page) . $query);
     }
 
     private function setup(): void
     {
         if ((int) $this->model->scalar('SELECT COUNT(*) FROM users') > 0) {
-            redirect('?page=login');
+            $this->render('setup', ['title' => 'Pendaftaran awal selesai', 'setupClosed' => true]);
+            return;
         }
-        $this->render('setup', ['title' => 'Buat akun pemilik']);
+        $this->render('setup', ['title' => 'Buat akun pemilik', 'setupClosed' => false]);
     }
 
     private function createInitialOwner(): void
@@ -499,12 +516,20 @@ final class AppController
                     throw new RuntimeException('Masukkan email yang valid dan kata sandi minimal 10 karakter.');
                 }
                 $statement = Database::connection()->prepare('INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, "owner")');
-                $statement->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT)]);
+                try {
+                    $statement->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT)]);
+                } catch (PDOException $exception) {
+                    if ($exception->getCode() === '23000') {
+                        throw new RuntimeException('Email tersebut sudah terdaftar. Gunakan email lain atau masuk ke akun yang sudah ada.', 0, $exception);
+                    }
+                    throw $exception;
+                }
             }
         } finally {
             $this->model->scalar("SELECT RELEASE_LOCK('si_smart_pos_initial_owner')");
         }
         if ($alreadyExists) {
+            flash('error', 'Pendaftaran akun pemilik sudah ditutup karena akun usaha telah dibuat. Masuk, lalu kelola akun dari menu Pengguna.');
             redirect('?page=login');
         }
         flash('success', 'Akun pemilik berhasil dibuat. Silakan masuk.');
@@ -528,13 +553,20 @@ final class AppController
             'inventory' => 'Persediaan & riwayat',
             'recipes' => 'Resep & HPP',
             'suppliers' => 'Supplier',
-            'purchases' => 'Pembelian & stok',
             'expenses' => 'Biaya operasional',
-            'pos' => 'Kasir / POS',
-            'sales' => 'Transaksi penjualan',
             'reports' => 'Laporan usaha',
             'users' => 'Pengguna & akses',
-        ][$page] ?? 'SI SMART POS';
+            'settings' => 'Profil usaha',
+        ][$page] ?? 'SI SMART UMKM';
+    }
+
+    private function toggleValue(string $key): bool
+    {
+        $value = input($key);
+        if (!in_array($value, ['0', '1', 0, 1], true)) {
+            throw new RuntimeException('Status yang dipilih tidak valid.');
+        }
+        return (string) $value === '1';
     }
 
     private function validDate(string $date, string $fallback): string
@@ -550,6 +582,15 @@ final class AppController
             throw new RuntimeException('Tanggal yang dimasukkan tidak valid.');
         }
         return $date;
+    }
+
+    private function dateTimeLocal(string $dateTime): string
+    {
+        $parsed = DateTimeImmutable::createFromFormat('!Y-m-d\TH:i', $dateTime);
+        if (!$parsed || $parsed->format('Y-m-d\TH:i') !== $dateTime) {
+            throw new RuntimeException('Tanggal dan waktu mutasi tidak valid.');
+        }
+        return $parsed->format('Y-m-d H:i:s');
     }
 
     private function requiredText(string $key, int $maxLength): string
@@ -572,8 +613,15 @@ final class AppController
 
     private function optionalId(string $key): ?int
     {
-        $value = (int) input($key);
-        return $value > 0 ? $value : null;
+        $raw = input($key);
+        if ($raw === '' || $raw === null || $raw === '0' || $raw === 0) {
+            return null;
+        }
+        $value = filter_var($raw, FILTER_VALIDATE_INT);
+        if ($value === false || $value <= 0) {
+            throw new RuntimeException('ID yang dipilih tidak valid.');
+        }
+        return $value;
     }
 
     private function number(string $key): float
@@ -585,6 +633,37 @@ final class AppController
         $value = $this->parseNumber($raw);
         if (!is_finite($value) || $value < 0) {
             throw new RuntimeException('Nilai ' . $key . ' harus berupa angka nol atau lebih.');
+        }
+        return $value;
+    }
+
+    private function quantity(string $key, bool $allowNegative = false): float
+    {
+        return $this->quantityValue(input($key), $allowNegative);
+    }
+
+    private function quantityValue(mixed $raw, bool $allowNegative = false): float
+    {
+        if (!is_string($raw) || trim($raw) === ''
+            || !preg_match('/^[+-]?(?:\d+(?:\.\d{1,3})?|\.\d{1,3})$/D', trim($raw))) {
+            throw new RuntimeException('Jumlah stok wajib berupa angka tanpa pemisah ribuan, maksimal tiga angka desimal (gunakan titik untuk desimal).');
+        }
+        $value = (float) trim($raw);
+        if (!is_finite($value) || (!$allowNegative && $value < 0)) {
+            throw new RuntimeException('Jumlah stok tidak valid atau tidak boleh negatif.');
+        }
+        return $value;
+    }
+
+    private function recipeQuantityValue(mixed $raw, string $label): float
+    {
+        if (!is_scalar($raw) || trim((string) $raw) === ''
+            || !preg_match('/^(?:\d+(?:\.\d{1,3})?|\.\d{1,3})$/D', trim((string) $raw))) {
+            throw new RuntimeException($label . ' wajib berupa angka lebih dari nol, tanpa pemisah ribuan, maksimal tiga desimal (gunakan titik untuk desimal).');
+        }
+        $value = (float) trim((string) $raw);
+        if (!is_finite($value) || $value <= 0) {
+            throw new RuntimeException($label . ' harus lebih besar dari nol.');
         }
         return $value;
     }
@@ -605,7 +684,6 @@ final class AppController
             if ($value === '') {
                 return 0.0;
             }
-            $value = str_replace(',', '.', $value);
         }
         return is_numeric($value) ? (float) $value : NAN;
     }

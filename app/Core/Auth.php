@@ -21,9 +21,9 @@ final class Auth
         );
         $statement->execute([$current['id']]);
         $user = $statement->fetch();
-        if (!$user || !(bool) $user['active']) {
+        if (!$user || !(bool) $user['active'] || !in_array($user['role'], ['owner', 'admin'], true)) {
             self::logout();
-            flash('error', 'Akun Anda tidak lagi aktif. Hubungi pemilik usaha.');
+            flash('error', 'Akun ini tidak memiliki akses pengelolaan usaha. Hubungi pemilik untuk mengatur akun.');
             return;
         }
         unset($user['active']);
@@ -43,12 +43,16 @@ final class Auth
         $statement->execute([mb_strtolower(trim($email))]);
         $user = $statement->fetch();
 
-        if (!$user || !(bool) $user['active'] || !password_verify($password, $user['password'])) {
+        if (
+            !$user
+            || !(bool) $user['active']
+            || !in_array($user['role'], ['owner', 'admin'], true)
+            || !password_verify($password, $user['password'])
+        ) {
             return false;
         }
 
         session_regenerate_id(true);
-        unset($_SESSION['pos_preview']);
         unset($user['password'], $user['active']);
         $_SESSION['user'] = $user;
         return true;
@@ -57,7 +61,6 @@ final class Auth
     public static function logout(): void
     {
         unset($_SESSION['user']);
-        unset($_SESSION['pos_preview']);
         session_regenerate_id(true);
     }
 
